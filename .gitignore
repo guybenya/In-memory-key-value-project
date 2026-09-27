@@ -1,0 +1,12 @@
+# Compiled object files
+*.o
+
+# Executables
+*.out
+server
+
+# macOS system files
+.DS_Store
+
+# VS Code settings
+.vscode/
