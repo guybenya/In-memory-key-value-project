@@ -22,6 +22,8 @@ HashTable* create_table() {
     }
 
     // HEAP ALLOCATION: We allocate memory for the array of Node pointers. 
+
+    table->buckets = (Node **)malloc(TABLE_SIZE * sizeof(Node *));
     if (table->buckets == NULL) {
         // If the second allocation (for 'buckets') fails, we must free the first
         // one (for 'table') to prevent memory leak. 

@@ -91,7 +91,7 @@ void handle_client(int client_fd, HashTable *db) {
         // end of each found word.
         // HEAP - POINTER: points directly to the first word INSIDE the existing heap buffer
         // There is no new memory allocation here.
-        char *command = strtok_r(buffer, "\r\n", &saveptr);
+        char *command = strtok_r(buffer, "\r\n ", &saveptr);
 
         if (command != NULL) {
             // FUNCTION: strcmp(string1, string2)
@@ -103,8 +103,8 @@ void handle_client(int client_fd, HashTable *db) {
                 // continue parsing from where it left off.
                 // POINTERS: key and value point to the
                 // next words inside the same heap buffer.
-                char *key = strtok_r (NULL, "\r\n", &saveptr);
-                char *value = strtok_r (NULL, "\r\n", &saveptr);
+                char *key = strtok_r (NULL, "\r\n ", &saveptr);
+                char *value = strtok_r (NULL, "\r\n ", &saveptr);
 
                 if (key != NULL && value != NULL) {
                     db_set(db, key,value);
@@ -126,7 +126,7 @@ void handle_client(int client_fd, HashTable *db) {
             }
             else if (strcmp(command, "GET") == 0) {
 
-                char *key = strtok_r (NULL, "\r\n" , &saveptr);
+                char *key = strtok_r (NULL, "\r\n " , &saveptr);
 
                 if (key != NULL) {
                     // RETRIVE FROM DATABASE
@@ -148,7 +148,7 @@ void handle_client(int client_fd, HashTable *db) {
                     }
                 }
                 else {
-                    char *error = "ERROR - Usage: GET <key> <value> \n";
+                    char *error = "ERROR - Usage: GET <key> \n";
                     write(client_fd, error, strlen(error));
                 }
             }
