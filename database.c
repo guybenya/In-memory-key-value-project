@@ -102,13 +102,22 @@ void db_set(HashTable *table, const char *key, const char *value) {
     // HEAP ALLOCATION: We must explicitly allocate new memory for the key string and copy its contents - DEEP COPY
     // If we just pointed to the existing key, it would be overwritten by the next client message in the buffer. 
     // MEMORY OWNER: The table owns this string memory. 
-    newNode->key = (char *)malloc(strlen(key) + 1);
-    strcpy(newNode->key, key);
+    newNode->key = strdup(key);
+    if (newNode->key == NULL) {
+        perror("Failed to allocate key");
+        free(newNode);
+        return;
+    }
 
     // HEAP ALLOCATION: same rationale for the value string. 
     // MEMORY OWNER: the table as well
-    newNode->value = (char *)malloc(strlen(value) + 1); // (char *) - Type casting
-    strcpy(newNode->value, value);
+    newNode->value = strdup(value);
+    if (newNode->value == NULL) {
+        perror("Failed to allocate value");
+        free(newNode->key);
+        free(newNode);
+        return;
+    }
 
     // LINKED LIST INSERTION: Point the new node to the current head of the list at this bucket, then update the bucket to point to our new node (insert at head). 
     newNode->next = table->buckets[index];
