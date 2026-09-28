@@ -63,6 +63,30 @@ static Node* find_node(HashTable *table, const char *key) {
 // Stores a key-value pair in the hash table. 
 // Resolves collisions by adding to the front of the linked list. 
 void db_set(HashTable *table, const char *key, const char *value) {
+    // UPDATE PATH: If the key already exists, replace its value instead of creating a duplicate node.
+    // ORDER: Search BEFORE computing the index - find_node hashes internally, and the update path doesn't need 'index'.
+    Node *existing = find_node(table,key);
+    if (existing != NULL) {
+        // HEAP ALLOCATION: Allocate and copy new value BEFORE freeing the old one.
+        // If the allocation fails, the old value stays intact and the table remains valid.
+        // ALLOCATE BEFORE FREE: If free() came first and strdup() failed, the node would point to
+        // freed memory (dangling pointer) and the next GET would read garbage or crash.
+        char *new_value = strdup(value);
+        if (new_value == NULL) {
+            perror("Failed to allocate value");
+            return;
+        }
+
+        // HEAP DEALLOCATION: The old value string is no longer needed. Without free() it would leak forever.
+        free(existing->value);
+
+        // MEMORY OWNER: The node now owns the new string.
+        existing->value = new_value;
+
+        // GUARD CLAUSE: Early return so we don't fall through to the insert path and create a duplicate node.
+        return;
+    }
+
     // Determine the bucket index using our hash function
     unsigned long index = hash_function(key);
 
