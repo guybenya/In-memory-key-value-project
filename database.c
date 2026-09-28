@@ -39,6 +39,26 @@ HashTable* create_table() {
     return table;
 }
 
+// FUNCTION: find_node(table,key)
+// Searches the bucket's linked list for a node with matching key. 
+// Returns a pointer to existing node, or NULL if the key is not found. 
+// 'static' makes this function private to database.c (like 'private' in Java)
+static Node* find_node(HashTable *table, const char *key) {
+    unsigned long index = hash_function(key);
+
+    // POINTER: 'current' is a traversal pointer on the stack. No new memory is allocated. 
+    Node *current = table->buckets[index];
+
+    while (current != NULL) {
+        if (strcmp(current->key, key) == 0) {
+            // POINTER: return the node itself (not just its value), so callers can modify it
+            return current;
+        }
+        current = current->next;
+    }
+    return NULL;
+}
+
 // FUNCTION: db_set(table,key,value)
 // Stores a key-value pair in the hash table. 
 // Resolves collisions by adding to the front of the linked list. 
@@ -61,33 +81,21 @@ void db_set(HashTable *table, const char *key, const char *value) {
     newNode->key = (char *)malloc(strlen(key) + 1);
     strcpy(newNode->key, key);
 
-    // HEAP ALLOCATION: same rationale for the valye string. 
+    // HEAP ALLOCATION: same rationale for the value string. 
     // MEMORY OWNER: the table as well
     newNode->value = (char *)malloc(strlen(value) + 1); // (char *) - Type casting
     strcpy(newNode->value, value);
 
-    // LINKED LIST INSERTION: Point the new node to the curren head of the list at this bucket, the update the bucket to point to our new node (insert at head). 
+    // LINKED LIST INSERTION: Point the new node to the current head of the list at this bucket, then update the bucket to point to our new node (insert at head). 
     newNode->next = table->buckets[index];
     table->buckets[index] = newNode;
 
 }
 
-// FUNCTION: Searches for a key and returns its associated value. 
-char* db_get (HashTable *table, const char *key) {
-    unsigned long index = hash_function(key);
-
-    // POINTER: 'current' is a traversal pointer sitting on the stack. It points to the existing Nodes inside the heap and read them. It does NOT allocate any new memory. 
-    Node *current = table->buckets[index];
-
-    // Traverse the linked list at this bucket in case of collisions
-    while (current != NULL) {
-        // Use strcmp to find the exact matching key
-        if (strcmp(current->key, key) == 0) {
-            // POINTER: return a pointer to the exsiting value string. 
-            return current->value;
-        }
-        current = current->next;
-    }
-    // Return NULL if the key was not found in the list
-    return NULL;
+// FUNCTION: searches for a key and returns its associated value. 
+char* db_get(HashTable *table, const char *key) {
+    Node *node = find_node(table,key);
+    
+    // POINTER: return a pointer to the existing value string, or NULL if the key was not found. 
+    return (node != NULL) ? node->value : NULL;
 }

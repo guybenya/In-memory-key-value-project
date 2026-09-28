@@ -6,7 +6,7 @@
 
 #define TABLE_SIZE 1000
 
-// Strcuct representing a single key-value pair
+// Struct representing a single key-value pair
 typedef struct Node {
     // POINTER: 'key' points to a dynamically allocated string on the heap. 
     char *key;
@@ -14,7 +14,7 @@ typedef struct Node {
     // POINTER: 'value' points to a dynamically allocated string on the heap.
     char *value;
 
-    // POINTER: 'next' pointes to the next node in the linked list (for collisions). 
+    // POINTER: 'next' points to the next node in the linked list (for collisions). 
     struct Node *next;
 
 } Node;
