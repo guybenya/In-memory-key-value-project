@@ -30,6 +30,6 @@ HashTable* create_table();
 unsigned long hash_function(const char *str);
 
 
-void db_set(HashTable *table, const char *key, const char *value);
+int db_set(HashTable *table, const char *key, const char *value); // Returns 0 on success, -1 on allocation failure. 
 char* db_get(HashTable *table, const char *key);
 #endif

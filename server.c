@@ -107,15 +107,19 @@ void handle_client(int client_fd, HashTable *db) {
                 char *value = strtok_r (NULL, "\r\n ", &saveptr);
 
                 if (key != NULL && value != NULL) {
-                    db_set(db, key,value);
+                    if (db_set(db, key,value) == 0) {
+                        // POINTER: response points to a static string located in Read-Only memory. 
+                        char *response = "OK - Saved to database\n";
 
-                    // POINTER: response points to a static string located in Read-Only memory. 
-                    char *response = "OK - Saved to database\n";
-
-                    // SYSTEM CALL: write(fd, buffer, count)
-                    // Sends exactly strlen(response) bytes
-                    // back to the client over the network.
-                    write (client_fd, response, strlen(response));
+                        // SYSTEM CALL: write(fd, buffer, count)
+                        // Sends exactly strlen(response) bytes
+                        // back to the client over the network.
+                        write (client_fd, response, strlen(response));
+                    }
+                    else {
+                        char *error = "ERROR - Failed to save \n";
+                        write(client_fd,error,strlen(error));
+                    }
                     
                 }
                 else {

@@ -62,7 +62,7 @@ static Node* find_node(HashTable *table, const char *key) {
 // FUNCTION: db_set(table,key,value)
 // Stores a key-value pair in the hash table. 
 // Resolves collisions by adding to the front of the linked list. 
-void db_set(HashTable *table, const char *key, const char *value) {
+int db_set(HashTable *table, const char *key, const char *value) {
     // UPDATE PATH: If the key already exists, replace its value instead of creating a duplicate node.
     // ORDER: Search BEFORE computing the index - find_node hashes internally, and the update path doesn't need 'index'.
     Node *existing = find_node(table,key);
@@ -74,7 +74,7 @@ void db_set(HashTable *table, const char *key, const char *value) {
         char *new_value = strdup(value);
         if (new_value == NULL) {
             perror("Failed to allocate value");
-            return;
+            return -1;
         }
 
         // HEAP DEALLOCATION: The old value string is no longer needed. Without free() it would leak forever.
@@ -84,7 +84,7 @@ void db_set(HashTable *table, const char *key, const char *value) {
         existing->value = new_value;
 
         // GUARD CLAUSE: Early return so we don't fall through to the insert path and create a duplicate node.
-        return;
+        return 0;
     }
 
     // Determine the bucket index using our hash function
@@ -96,7 +96,7 @@ void db_set(HashTable *table, const char *key, const char *value) {
     Node *newNode = (Node *)malloc(sizeof(Node));
     if ( newNode == NULL) {
         perror("Failed to allocate node");
-        return;
+        return -1;
     }
 
     // HEAP ALLOCATION: We must explicitly allocate new memory for the key string and copy its contents - DEEP COPY
@@ -106,7 +106,7 @@ void db_set(HashTable *table, const char *key, const char *value) {
     if (newNode->key == NULL) {
         perror("Failed to allocate key");
         free(newNode);
-        return;
+        return -1;
     }
 
     // HEAP ALLOCATION: same rationale for the value string. 
@@ -116,13 +116,13 @@ void db_set(HashTable *table, const char *key, const char *value) {
         perror("Failed to allocate value");
         free(newNode->key);
         free(newNode);
-        return;
+        return -1;
     }
 
     // LINKED LIST INSERTION: Point the new node to the current head of the list at this bucket, then update the bucket to point to our new node (insert at head). 
     newNode->next = table->buckets[index];
     table->buckets[index] = newNode;
-
+    return 0;
 }
 
 // FUNCTION: searches for a key and returns its associated value. 
