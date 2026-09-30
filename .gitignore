@@ -3,7 +3,10 @@
 
 # Executables
 *.out
-server
+# Build output
+build/
+*.dSYM/
+
 
 # macOS system files
 .DS_Store
