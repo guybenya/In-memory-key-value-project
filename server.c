@@ -156,6 +156,23 @@ void handle_client(int client_fd, HashTable *db) {
                     write(client_fd, error, strlen(error));
                 }
             }
+            else if (strcmp(command, "DEL") == 0) {
+                char *key = strtok_r (NULL, "\r\n " , &saveptr);
+                if (key != NULL) {
+                    if (db_delete(db,key) == 1) {
+                        char *response = "OK - Deleted\n";
+                        write(client_fd,response,strlen(response));
+                    }
+                    else {
+                        char *error = "ERROR - Key not found\n";
+                        write(client_fd, error, strlen(error));                        
+                    }
+                }
+                else {
+                        char *error = "ERROR - Usage: DEL <key>\n";
+                        write(client_fd, error, strlen(error));
+                }
+            }
             else {
                 char *error = "ERROR - Unknown command\n";
                 write(client_fd,error,strlen(error));

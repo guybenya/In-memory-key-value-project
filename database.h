@@ -29,7 +29,13 @@ typedef struct HashTable {
 HashTable* create_table();
 unsigned long hash_function(const char *str);
 
+// Returns 0 on success, -1 on allocation failure.
+int db_set(HashTable *table, const char *key, const char *value);
 
-int db_set(HashTable *table, const char *key, const char *value); // Returns 0 on success, -1 on allocation failure. 
+// Returns a pointer to the value, or NULL if the key was not found.
 char* db_get(HashTable *table, const char *key);
+
+// Removes a key and frees its memory. Returns 1 if the key was deleted, 0 if it was not found.
+int db_delete(HashTable *table, const char *key);
+
 #endif

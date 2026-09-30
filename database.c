@@ -132,3 +132,43 @@ char* db_get(HashTable *table, const char *key) {
     // POINTER: return a pointer to the existing value string, or NULL if the key was not found. 
     return (node != NULL) ? node->value : NULL;
 }
+
+// FUNCTION: db_delete(table, key)
+// Removes a key-value pair from the hash table and frees all of its memory.
+// Returns 1 if the key was deleted, 0 if it was not found.
+int db_delete(HashTable *table, const char *key) {
+    // Determine the bucket index using our hash function
+    unsigned long index = hash_function(key);
+
+    // POINTER TO POINTER: 'link' does not point to a node - it points to the pointer that points to the current node.
+    // It starts at the bucket slot itself, and later moves to the 'next' field of each node.
+    // This way, deleting the head and deleting from the middle are the SAME operation - no special case needed.
+    Node **link = &table->buckets[index];
+
+    // Traverse the linked list at this bucket. '*link' is the current node (NULL = end of the list).
+    while (*link != NULL) {
+        if (strcmp((*link)->key, key) == 0) {
+            // POINTER: Save the node before unlinking it - after the next line it is no longer reachable from the list.
+            Node *target = *link;
+
+            // UNLINK: Change the list itself - whoever pointed to 'target' (bucket slot or previous node's 'next')
+            // now skips it and points to the node after it.
+            // ORDER: Unlink BEFORE freeing, so the list never points to freed memory.
+            *link = target->next;
+
+            // HEAP DEALLOCATION: Free from the inside out - the strings first, then the node that holds them.
+            // Freeing 'target' first would make 'target->key' and 'target->value' a use-after-free.
+            free(target->key);
+            free(target->value);
+            free(target);
+            return 1;
+        }
+
+        // ADVANCE: Move the cursor only - the list is not modified.
+        // 'link' now points to the current node's 'next' field, the next place that holds a pointer to a node.
+        link = &(*link)->next;
+    }
+
+    // The key was not found in the list
+    return 0;
+}
