@@ -29,6 +29,10 @@ typedef struct HashTable {
 HashTable* create_table();
 unsigned long hash_function(const char *str);
 
+// Frees the entire table: every node, its key and value strings, the buckets array and the table itself.
+// Safe to call with NULL.
+void db_destroy(HashTable *table);
+
 // Returns 0 on success, -1 on allocation failure.
 int db_set(HashTable *table, const char *key, const char *value);
 

@@ -39,6 +39,40 @@ HashTable* create_table() {
     return table;
 }
 
+// FUNCTION: db_destroy(table)
+// Frees the entire table: every node, its key and value strings, the buckets array and the table itself.
+// NOTE: The caller's pointer still holds the old address afterwards - set it to NULL after calling.
+void db_destroy(HashTable *table) {
+    // NULL table - nothing to free (same convention as free(NULL)).
+    if (table == NULL) {
+        return;
+    }
+
+    // Iterating every bucket in the table
+    for (int i = 0; i < TABLE_SIZE; i++) {
+        // POINTER: 'current' is a traversal pointer on the stack.
+        Node *current = table->buckets[i];
+
+        // Inner loop - iterate the linked list in every bucket
+        while (current != NULL) {
+            // SAVE NEXT BEFORE FREE: After free(current), reading current->next would be a use-after-free.
+            Node *next = current->next;
+
+            // HEAP DEALLOCATION: Free from the inside out - the strings first, then the node that holds them.
+            free(current->key);
+            free(current->value);
+            free(current);
+
+            current = next;
+        }
+    }
+
+    // HEAP DEALLOCATION: Reverse order of create_table() - 'buckets' is a field INSIDE 'table',
+    // so freeing 'table' first would make reading 'table->buckets' a use-after-free.
+    free(table->buckets);
+    free(table);
+}
+
 // FUNCTION: find_node(table,key)
 // Searches the bucket's linked list for a node with matching key. 
 // Returns a pointer to existing node, or NULL if the key is not found. 
