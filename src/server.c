@@ -24,6 +24,18 @@ int start_server(int port) {
         exit(EXIT_FAILURE);
     }
 
+    // SYSTEM CALL: setsockopt(fd, level, option, value_ptr, value_len) - changes a setting of the socket.
+    // SO_REUSEADDR: After the server stops, the OS keeps its old connections in TIME_WAIT for ~30-60 seconds,
+    // and bind() would fail with "Address already in use". This option lets us bind to the port immediately.
+    // MUST be set BEFORE bind(), because it changes what bind() is allowed to do.
+    // 'opt' = 1 means "enable". The value is passed by pointer (void *) because different options use
+    // different types - sizeof(opt) tells the OS how many bytes to read from that pointer.
+    int opt = 1;
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        perror("setsockopt failed");
+        exit(EXIT_FAILURE);
+    }
+
     // declares a specifically designed to hold IPv4 address and port information. 
     struct sockaddr_in address;
 
