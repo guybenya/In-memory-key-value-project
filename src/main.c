@@ -5,10 +5,18 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
+#include <signal.h>
 
 
 int main() {
     int port = 8080;
+    
+    // SIGNAL: Writing to a socket whose client already disconnected makes the OS send SIGPIPE,
+    // and its default action KILLS the whole process (exit code 141 = 128 + signal 13).
+    // SIG_IGN tells the OS to ignore it - write() then just returns -1 (errno = EPIPE),
+    // an ordinary error we can handle, and the server keeps serving the other clients.
+    // Set once, before the server starts, because it applies to the entire process.
+    signal(SIGPIPE, SIG_IGN);
 
     // call our custom function to setup the server. This function handles the socket, bind and listen SYSTEM CALLS internally. It returns the main server file descriptor. 
     int server_fd = start_server(port);

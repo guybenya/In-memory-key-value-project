@@ -8,6 +8,7 @@
 #include <netinet/in.h>
 
 
+
 // Establishing the structure
 int start_server(int port) {
     // System call to create a new network endpoint (socket).
