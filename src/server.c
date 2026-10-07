@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <errno.h>
 
 
 
@@ -70,6 +71,25 @@ int start_server(int port) {
     return server_fd;
 }
 
+// Sends exactly 'len' bytes from 'buf'. Returns 0 on success, -1 on failure.
+static int send_all(int fd, const char *buf, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = write(fd, buf + sent, len - sent);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;  
+        }
+        else {
+            sent = sent + n;
+        }
+    }
+    return 0;
+}
+
+
 void handle_client(int client_fd, HashTable *db) {
     // POINTER: buffer pointsto dynamically allocated memory from the heap. 
     // OWNER: handle_client is the owner and must free this memory at the end. 
@@ -95,11 +115,21 @@ void handle_client(int client_fd, HashTable *db) {
             break;
         }
 
+        // REPLY: Each command branch below only CHOOSES the reply - a single send at the end of the loop sends it.
+        // POINTER: 'reply' points either to a string literal (read-only memory) or to 'response_buf'.
+        // NULL means "nothing to send" (e.g. an empty line).
+        const char *reply = NULL;
+
+        // STACK ALLOCATION: Declared at the loop level (not inside the GET branch) on purpose -
+        // 'reply' may point to it, and it must still exist when the reply is sent at the end of the loop.
+        // A buffer declared inside the GET block would be gone by then (dangling pointer).
+        char response_buf[1024];
+
         // STACK - POINTER: tracks the current parsing position for the strtok_r.
         char *saveptr;
 
         // FUNCTION: strtok_r(string, delimiters, state)
-        // Splits the string into words (tokens). 
+        // Splits the string into words (tokens).
         // Modifies the original buffer by inserting null-terminators ('\0') at the
         // end of each found word.
         // HEAP - POINTER: points directly to the first word INSIDE the existing heap buffer
@@ -121,24 +151,14 @@ void handle_client(int client_fd, HashTable *db) {
 
                 if (key != NULL && value != NULL) {
                     if (db_set(db, key,value) == 0) {
-                        // POINTER: response points to a static string located in Read-Only memory. 
-                        char *response = "OK - Saved to database\n";
-
-                        // SYSTEM CALL: write(fd, buffer, count)
-                        // Sends exactly strlen(response) bytes
-                        // back to the client over the network.
-                        write (client_fd, response, strlen(response));
+                        reply = "OK - Saved to database\n";
                     }
                     else {
-                        char *error = "ERROR - Failed to save \n";
-                        write(client_fd,error,strlen(error));
+                        reply = "ERROR - Failed to save \n";
                     }
-                    
                 }
                 else {
-                    char *error = "ERROR - Usage: SET <key> <value> \n";
-                    write (client_fd, error, strlen(error));
-
+                    reply = "ERROR - Usage: SET <key> <value> \n";
                 }
             }
             else if (strcmp(command, "GET") == 0) {
@@ -147,48 +167,46 @@ void handle_client(int client_fd, HashTable *db) {
 
                 if (key != NULL) {
                     // RETRIVE FROM DATABASE
-                    // POINTER: 'result' points to the existing string inside the database's heap memory. 
+                    // POINTER: 'result' points to the existing string inside the database's heap memory.
                     char *result = db_get(db, key);
 
                     if (result != NULL) {
-                        // STACK ALLOCATION: response_buf is a local array. Memory is automatically reclaimded by the systme when this 'if' block ends. No need to use free().
-                        char response_buf[1024];
-                        
-                        // FUNCTION: snprintf securely formats strings. It combines "VALUE: " with the retriving string. 
+                        // FUNCTION: snprintf securely formats strings. It combines "VALUE: " with the retrieved string.
                         snprintf(response_buf, sizeof(response_buf), "VALUE: %s\n", result);
-
-                        write(client_fd, response_buf, strlen(response_buf));
+                        reply = response_buf;
                     }
                     else {
-                        char *error = "ERROR - Key not found\n";
-                        write(client_fd, error, strlen(error));
+                        reply = "ERROR - Key not found\n";
                     }
                 }
                 else {
-                    char *error = "ERROR - Usage: GET <key> \n";
-                    write(client_fd, error, strlen(error));
+                    reply = "ERROR - Usage: GET <key> \n";
                 }
             }
             else if (strcmp(command, "DEL") == 0) {
                 char *key = strtok_r (NULL, "\r\n " , &saveptr);
                 if (key != NULL) {
                     if (db_delete(db,key) == 1) {
-                        char *response = "OK - Deleted\n";
-                        write(client_fd,response,strlen(response));
+                        reply = "OK - Deleted\n";
                     }
                     else {
-                        char *error = "ERROR - Key not found\n";
-                        write(client_fd, error, strlen(error));                        
+                        reply = "ERROR - Key not found\n";
                     }
                 }
                 else {
-                        char *error = "ERROR - Usage: DEL <key>\n";
-                        write(client_fd, error, strlen(error));
+                    reply = "ERROR - Usage: DEL <key>\n";
                 }
             }
             else {
-                char *error = "ERROR - Unknown command\n";
-                write(client_fd,error,strlen(error));
+                reply = "ERROR - Unknown command\n";
+            }
+        }
+
+        // SEND: One place that sends the chosen reply. send_all retries until every byte is written.
+        // If it fails (e.g. the client disconnected), stop serving this client - the connection is dead.
+        if (reply != NULL) {
+            if (send_all(client_fd, reply, strlen(reply)) < 0) {
+                break;
             }
         }
     }
