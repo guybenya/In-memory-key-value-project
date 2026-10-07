@@ -25,6 +25,24 @@ $(BUILD):
 test: $(BUILD)/test_database
 	./$(BUILD)/test_database
 
+# SANITIZERS: Rebuild the tests with runtime memory checks.
+# AddressSanitizer catches use-after-free, double free and out-of-bounds access.
+# UndefinedBehaviorSanitizer catches undefined behavior (e.g. signed integer overflow).
+# -fno-omit-frame-pointer keeps the full call chain in error reports.
+SAN_FLAGS = -fsanitize=address,undefined -fno-omit-frame-pointer
+
+asan: tests/test_database.c src/database.c src/database.h | $(BUILD)
+	$(CC) $(CFLAGS) $(SAN_FLAGS) tests/test_database.c src/database.c -o $(BUILD)/test_asan
+	./$(BUILD)/test_asan
+
+# LEAKS: AddressSanitizer can't detect leaks on macOS, so use the built-in 'leaks' tool.
+# It runs the tests and reports heap memory still allocated at exit (exit code 1 = leaks found).
+leaks: $(BUILD)/test_database
+	leaks --atExit -- ./$(BUILD)/test_database
+
+# CHECK: Everything at once - regular tests, sanitizers and leak detection. Run before every commit.
+check: test asan leaks
+
 # MUTATION TEST: Breaks the deep copy on purpose and checks that the tests notice.
 # A broken copy of database.c is generated in build/ (the real source is never touched),
 # where db_set stores the caller's value pointer instead of a strdup() copy.
@@ -45,4 +63,4 @@ clean:
 
 -include $(wildcard $(BUILD)/*.d)
 
-.PHONY: all test mutation clean
+.PHONY: all test asan leaks check mutation clean
