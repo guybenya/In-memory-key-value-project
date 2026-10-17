@@ -185,6 +185,82 @@ static void test_limits(void) {
     free(buf);
 }
 
+// TEST: Many small appends - the buffer grows (more than once) and keeps every byte in order.
+static void test_buf_grows(void) {
+    RespBuf b = {0};
+    char expected[1000];
+
+    for (int i = 0; i < 1000; i++) {
+        char c = (char)('a' + i % 26);
+        expected[i] = c;
+        assert(resp_buf_append(&b, &c, 1) == 0);
+        assert(b.len <= b.cap);     // the invariant must hold after every append
+    }
+    assert(b.len == 1000);
+    assert(b.cap >= 1000);
+    assert(memcmp(b.data, expected, 1000) == 0);
+
+    resp_buf_free(&b);
+    assert(b.data == NULL && b.len == 0 && b.cap == 0);
+}
+
+// TEST: Edge cases of an empty buffer - appending 0 bytes and freeing without ever appending.
+static void test_buf_empty(void) {
+    RespBuf b = {0};
+    assert(resp_buf_append(&b, "", 0) == 0);    // must not crash or pass NULL to memcpy
+    assert(b.len == 0);
+    resp_buf_free(&b);
+    resp_buf_free(&b);                          // freeing twice is safe: the first call reset it to NULL
+}
+
+// Checks that the buffer holds exactly 'expected' (same length, same bytes), then empties it.
+static void assert_buf(RespBuf *b, const char *expected, size_t expected_len) {
+    assert(b->len == expected_len);
+    assert(memcmp(b->data, expected, expected_len) == 0);
+    b->len = 0;     // reuse the same memory for the next reply
+}
+
+// TEST: Every reply type produces exactly the bytes redis-cli expects.
+static void test_write_replies(void) {
+    RespBuf b = {0};
+
+    assert(resp_write_simple(&b, "OK") == 0);
+    assert_buf(&b, LIT("+OK\r\n"));
+
+    assert(resp_write_error(&b, "unknown command") == 0);
+    assert_buf(&b, LIT("-ERR unknown command\r\n"));
+
+    assert(resp_write_bulk(&b, "guy", 3) == 0);
+    assert_buf(&b, LIT("$3\r\nguy\r\n"));
+
+    assert(resp_write_bulk(&b, "", 0) == 0);                 // empty string is not the same as null
+    assert_buf(&b, LIT("$0\r\n\r\n"));
+
+    assert(resp_write_bulk(&b, "a\r\nb", 4) == 0);           // binary-safe on the way out too
+    assert_buf(&b, LIT("$4\r\na\r\nb\r\n"));
+
+    assert(resp_write_null(&b) == 0);
+    assert_buf(&b, LIT("$-1\r\n"));
+
+    assert(resp_write_integer(&b, 1) == 0);
+    assert_buf(&b, LIT(":1\r\n"));
+
+    assert(resp_write_integer(&b, -42) == 0);
+    assert_buf(&b, LIT(":-42\r\n"));
+
+    resp_buf_free(&b);
+}
+
+// TEST: Several replies in a row are appended one after another (pipelined replies).
+static void test_write_appends(void) {
+    RespBuf b = {0};
+    assert(resp_write_simple(&b, "OK") == 0);
+    assert(resp_write_bulk(&b, "guy", 3) == 0);
+    assert(resp_write_null(&b) == 0);
+    assert_buf(&b, LIT("+OK\r\n$3\r\nguy\r\n$-1\r\n"));
+    resp_buf_free(&b);
+}
+
 typedef struct {
     const char *name;
     void (*fn)(void);
@@ -198,6 +274,10 @@ static const TestCase tests[] = {
     {"pipelined",          test_pipelined},
     {"malformed",          test_malformed},
     {"limits",             test_limits},
+    {"buf_grows",          test_buf_grows},
+    {"buf_empty",          test_buf_empty},
+    {"write_replies",      test_write_replies},
+    {"write_appends",      test_write_appends},
 };
 
 // USAGE: ./build/test_resp             -> runs all tests
