@@ -85,8 +85,12 @@ This section is kept honest and up to date. Everything here is planned to be fix
    clients at once.
 3. **Queue core:** commands to push, reserve and acknowledge jobs, with a visibility timeout that returns
    jobs of crashed workers to the queue.
-4. **Python client and worker framework**, plus an example batch-processing app that shows throughput
-   growing as workers are added.
+4. **Python client and worker framework**, plus an example app: batch analysis of protein sequences.
+   A FASTA file is split into jobs of a few hundred sequences each. Workers validate the sequences
+   (invalid characters, empty or duplicate entries), compute their properties (length, molecular weight,
+   isoelectric point, composition, hydrophobicity), and align each one against a small set of known
+   proteins to find its closest match. Results are stored in SQLite and queried with SQL. A benchmark
+   shows how throughput changes with the number of workers and with the job size.
 5. **Durability:** an append-only log and recovery from it, with a `kill -9` demo where no job is lost.
 6. **Packaging:** Docker image published automatically on every release.
 
