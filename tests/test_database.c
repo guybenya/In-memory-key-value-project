@@ -14,7 +14,7 @@ static void test_set_and_get(void) {
     char *value = db_get(table, "name");
     // Check for NULL BEFORE strcmp - strcmp(NULL, ...) would crash instead of failing clearly.
     assert(value != NULL);
-    assert(strcmp(value, "WRONG") == 0); // TEMPORARY: broken on purpose to prove CI fails - will be reverted
+    assert(strcmp(value, "guy") == 0);
 
     db_destroy(table);
 }
