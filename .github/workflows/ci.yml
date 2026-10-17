@@ -1,0 +1,35 @@
+# CI: builds the server and runs every check on Linux and macOS for each push and pull request.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    strategy:
+      # Don't cancel the other OS when one fails - we want to see both results.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Show compiler version
+        run: clang --version
+
+      # -Werror turns every compiler warning into an error, so warnings can't reach main.
+      - name: Build the server
+        run: make all EXTRA_CFLAGS=-Werror
+
+      # Unit tests + AddressSanitizer/UBSan (+ the 'leaks' tool on macOS).
+      - name: Run tests and sanitizers
+        run: make check EXTRA_CFLAGS=-Werror
+
+      # Confirms the tests still catch a deliberately planted bug.
+      - name: Run mutation test
+        run: make mutation

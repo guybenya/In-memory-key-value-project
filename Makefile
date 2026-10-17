@@ -1,5 +1,6 @@
 CC      = clang
-CFLAGS  = -Wall -Wextra -g -Isrc
+# EXTRA_CFLAGS is empty by default. CI passes EXTRA_CFLAGS=-Werror so any warning fails the build there.
+CFLAGS  = -Wall -Wextra -g -Isrc $(EXTRA_CFLAGS)
 BUILD   = build
 
 # resp.o is left out until src/resp.c exists (RESP stage) - listing it breaks the build.

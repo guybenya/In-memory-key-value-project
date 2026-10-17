@@ -1,5 +1,7 @@
 # In-Memory Key-Value Server (on its way to a job queue)
 
+[![CI](https://github.com/guybenya/In-memory-key-value-project/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/guybenya/In-memory-key-value-project/actions/workflows/ci.yml)
+
 A TCP server written in C that stores key-value pairs in memory, using a hash table with separate chaining.
 
 This is the first stage of a larger project: the KV store is going to become the internal storage of a
