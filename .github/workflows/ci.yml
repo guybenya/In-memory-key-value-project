@@ -1,8 +1,11 @@
 # CI: builds the server and runs every check on Linux and macOS for each push and pull request.
 name: CI
 
+# Pushes to feature branches are tested through their pull request, so 'push' only needs main.
+# (Triggering on every push AND every PR ran each commit twice.)
 on:
   push:
+    branches: [main]
   pull_request:
 
 jobs:
@@ -11,13 +14,15 @@ jobs:
       # Don't cancel the other OS when one fails - we want to see both results.
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # Ubuntu is pinned so the environment only changes when we choose to
+        # (ubuntu-latest moves to Ubuntu 26 starting October 2026).
+        os: [ubuntu-24.04, macos-latest]
 
     runs-on: ${{ matrix.os }}
 
     steps:
       - name: Check out the code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Show compiler version
         run: clang --version
