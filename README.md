@@ -53,7 +53,7 @@ ERROR - Key not found
 | `make test`     | Builds and runs the unit tests for the hash table (`tests/test_database.c`).                  |
 | `make asan`     | Rebuilds the tests with AddressSanitizer and UndefinedBehaviorSanitizer and runs them.        |
 | `make leaks`    | Runs the tests under the macOS `leaks` tool and fails if any heap memory is left at exit.     |
-| `make check`    | Runs `test`, `asan` and `leaks` together. Run it before every commit.                         |
+| `make check`    | Runs `test` and `asan`, plus `leaks` on macOS. On Linux, `asan` already detects leaks.        |
 | `make mutation` | Builds a deliberately broken copy of `database.c` and checks that the tests catch the bug.    |
 
 A single test can be run by name, for example `./build/test_database deep_copy`.
@@ -74,7 +74,6 @@ This section is kept honest and up to date. Everything here is planned to be fix
   truncated.
 - **No persistence.** All data is lost when the server stops. *(Fix: append-only file, stage 5.)*
 - **Fixed port.** The port (8080) is hard-coded in `src/main.c`.
-- **`make check` works only on macOS** because it uses the `leaks` tool. *(Fix: in progress, stage 1.)*
 
 ## Roadmap
 
