@@ -6,6 +6,10 @@
 // Maximum number of arguments in a single command (e.g. "SET key value" = 3).
 #define RESP_MAX_ARGS 16
 
+// Maximum length in bytes of a single argument (1 MB). Protects the server from a client that
+// announces a huge length (e.g. "$999999999") and makes us wait for gigabytes that never arrive.
+#define RESP_MAX_BULK_LEN (1024 * 1024)
+
 // A parsed command. The argument pointers point INTO the caller's buffer - no memory is allocated.
 // NOTE: The arguments are NOT null-terminated; use argv_len for their length.
 typedef struct {

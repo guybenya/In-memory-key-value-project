@@ -3,8 +3,7 @@ CC      = clang
 CFLAGS  = -Wall -Wextra -g -Isrc $(EXTRA_CFLAGS)
 BUILD   = build
 
-# resp.o is left out until src/resp.c exists (RESP stage) - listing it breaks the build.
-SERVER_OBJS = $(BUILD)/main.o $(BUILD)/server.o $(BUILD)/database.o
+SERVER_OBJS = $(BUILD)/main.o $(BUILD)/server.o $(BUILD)/database.o $(BUILD)/resp.o
 TEST_OBJS   = $(BUILD)/test_database.o $(BUILD)/database.o
 
 all: $(BUILD)/server
