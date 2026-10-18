@@ -6,11 +6,35 @@
 #include <netinet/in.h>
 #include <unistd.h>
 #include <signal.h>
+#include <errno.h>
 
 
-int main() {
-    int port = 8080;
-    
+// AUTHOR: Claude
+// Reads the port from the command line: "./build/server [port]". Without an argument -> 8080.
+// Returns the port, or -1 if the argument is not a whole number between 1 and 65535.
+static int parse_port(int argc, char *argv[]) {
+    if (argc < 2) {
+        return 8080;
+    }
+    // strtol (string to long) - like Java's Long.parseLong, but it doesn't throw.
+    // It sets 'end' to the first character it could NOT convert, so "80x" or "" is detected:
+    // a valid number means at least one digit was read AND the whole string was used.
+    char *end;
+    errno = 0;
+    long value = strtol(argv[1], &end, 10);
+    if (end == argv[1] || *end != '\0' || errno != 0 || value < 1 || value > 65535) {
+        return -1;
+    }
+    return (int)value;
+}
+
+int main(int argc, char *argv[]) {
+    int port = parse_port(argc, argv);
+    if (port < 0) {
+        fprintf(stderr, "Usage: %s [port]   (port: 1-65535, default 8080)\n", argv[0]);
+        return 1;
+    }
+
     // SIGNAL: Writing to a socket whose client already disconnected makes the OS send SIGPIPE,
     // and its default action KILLS the whole process (exit code 141 = 128 + signal 13).
     // SIG_IGN tells the OS to ignore it - write() then just returns -1 (errno = EPIPE),

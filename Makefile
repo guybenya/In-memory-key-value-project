@@ -3,9 +3,9 @@ CC      = clang
 CFLAGS  = -Wall -Wextra -g -Isrc $(EXTRA_CFLAGS)
 BUILD   = build
 
-# resp.o is left out until src/resp.c exists (RESP stage) - listing it breaks the build.
-SERVER_OBJS = $(BUILD)/main.o $(BUILD)/server.o $(BUILD)/database.o
+SERVER_OBJS = $(BUILD)/main.o $(BUILD)/server.o $(BUILD)/database.o $(BUILD)/resp.o
 TEST_OBJS   = $(BUILD)/test_database.o $(BUILD)/database.o
+TEST_RESP_OBJS = $(BUILD)/test_resp.o $(BUILD)/resp.o
 
 all: $(BUILD)/server
 
@@ -13,6 +13,9 @@ $(BUILD)/server: $(SERVER_OBJS)
 	$(CC) $(CFLAGS) $^ -o $@
 
 $(BUILD)/test_database: $(TEST_OBJS)
+	$(CC) $(CFLAGS) $^ -o $@
+
+$(BUILD)/test_resp: $(TEST_RESP_OBJS)
 	$(CC) $(CFLAGS) $^ -o $@
 
 $(BUILD)/%.o: src/%.c | $(BUILD)
@@ -24,8 +27,9 @@ $(BUILD)/%.o: tests/%.c | $(BUILD)
 $(BUILD):
 	mkdir -p $(BUILD)
 
-test: $(BUILD)/test_database
+test: $(BUILD)/test_database $(BUILD)/test_resp
 	./$(BUILD)/test_database
+	./$(BUILD)/test_resp
 
 # SANITIZERS: Rebuild the tests with runtime memory checks.
 # AddressSanitizer catches use-after-free, double free and out-of-bounds access.
@@ -35,14 +39,17 @@ test: $(BUILD)/test_database
 # Without it, UBSan only prints a warning and continues - the tests would still "pass".
 SAN_FLAGS = -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all
 
-asan: tests/test_database.c src/database.c src/database.h | $(BUILD)
+asan: tests/test_database.c src/database.c src/database.h tests/test_resp.c src/resp.c src/resp.h | $(BUILD)
 	$(CC) $(CFLAGS) $(SAN_FLAGS) tests/test_database.c src/database.c -o $(BUILD)/test_asan
 	./$(BUILD)/test_asan
+	$(CC) $(CFLAGS) $(SAN_FLAGS) tests/test_resp.c src/resp.c -o $(BUILD)/test_resp_asan
+	./$(BUILD)/test_resp_asan
 
 # LEAKS: AddressSanitizer can't detect leaks on macOS, so use the built-in 'leaks' tool.
 # It runs the tests and reports heap memory still allocated at exit (exit code 1 = leaks found).
-leaks: $(BUILD)/test_database
+leaks: $(BUILD)/test_database $(BUILD)/test_resp
 	leaks --atExit -- ./$(BUILD)/test_database
+	leaks --atExit -- ./$(BUILD)/test_resp
 
 # OS DETECTION: 'uname -s' prints "Darwin" on macOS and "Linux" on Linux.
 # On Linux, AddressSanitizer includes LeakSanitizer, so 'make asan' already fails on leaks
@@ -72,9 +79,13 @@ mutation: tests/test_database.c src/database.c | $(BUILD)
 		echo "MUTANT KILLED - the test caught the bug, as expected."; \
 	fi
 
+# INTEGRATION TEST: starts the real server on a free port and talks RESP to it over TCP (Python standard library only).
+integration: $(BUILD)/server
+	python3 tests/integration_test.py ./$(BUILD)/server
+
 clean:
 	rm -rf $(BUILD)
 
 -include $(wildcard $(BUILD)/*.d)
 
-.PHONY: all test asan leaks check mutation clean
+.PHONY: all test asan leaks check mutation integration clean
