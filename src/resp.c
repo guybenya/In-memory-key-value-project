@@ -200,3 +200,12 @@ int resp_write_integer(RespBuf *b, long n) {
     int written = snprintf(line, sizeof(line), ":%ld\r\n", n);
     return resp_buf_append(b, line, (size_t)written);
 }
+
+// AUTHOR: Claude
+// Writes the header of an array reply. An array is a count followed by that many ordinary replies,
+// e.g. RESERVE answers *3 then :<id> $<payload> :<attempts>.
+int resp_write_array_header(RespBuf *b, long count) {
+    char line[32];
+    int written = snprintf(line, sizeof(line), "*%ld\r\n", count);
+    return resp_buf_append(b, line, (size_t)written);
+}

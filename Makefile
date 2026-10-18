@@ -3,9 +3,10 @@ CC      = clang
 CFLAGS  = -Wall -Wextra -g -Isrc $(EXTRA_CFLAGS)
 BUILD   = build
 
-SERVER_OBJS = $(BUILD)/main.o $(BUILD)/server.o $(BUILD)/database.o $(BUILD)/resp.o
+SERVER_OBJS = $(BUILD)/main.o $(BUILD)/server.o $(BUILD)/database.o $(BUILD)/resp.o $(BUILD)/queue.o
 TEST_OBJS   = $(BUILD)/test_database.o $(BUILD)/database.o
 TEST_RESP_OBJS = $(BUILD)/test_resp.o $(BUILD)/resp.o
+TEST_QUEUE_OBJS = $(BUILD)/test_queue.o $(BUILD)/queue.o
 
 all: $(BUILD)/server
 
@@ -18,6 +19,9 @@ $(BUILD)/test_database: $(TEST_OBJS)
 $(BUILD)/test_resp: $(TEST_RESP_OBJS)
 	$(CC) $(CFLAGS) $^ -o $@
 
+$(BUILD)/test_queue: $(TEST_QUEUE_OBJS)
+	$(CC) $(CFLAGS) $^ -o $@
+
 $(BUILD)/%.o: src/%.c | $(BUILD)
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
@@ -27,9 +31,10 @@ $(BUILD)/%.o: tests/%.c | $(BUILD)
 $(BUILD):
 	mkdir -p $(BUILD)
 
-test: $(BUILD)/test_database $(BUILD)/test_resp
+test: $(BUILD)/test_database $(BUILD)/test_resp $(BUILD)/test_queue
 	./$(BUILD)/test_database
 	./$(BUILD)/test_resp
+	./$(BUILD)/test_queue
 
 # SANITIZERS: Rebuild the tests with runtime memory checks.
 # AddressSanitizer catches use-after-free, double free and out-of-bounds access.
@@ -39,17 +44,20 @@ test: $(BUILD)/test_database $(BUILD)/test_resp
 # Without it, UBSan only prints a warning and continues - the tests would still "pass".
 SAN_FLAGS = -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all
 
-asan: tests/test_database.c src/database.c src/database.h tests/test_resp.c src/resp.c src/resp.h | $(BUILD)
+asan: tests/test_database.c src/database.c src/database.h tests/test_resp.c src/resp.c src/resp.h tests/test_queue.c src/queue.c src/queue.h | $(BUILD)
 	$(CC) $(CFLAGS) $(SAN_FLAGS) tests/test_database.c src/database.c -o $(BUILD)/test_asan
 	./$(BUILD)/test_asan
 	$(CC) $(CFLAGS) $(SAN_FLAGS) tests/test_resp.c src/resp.c -o $(BUILD)/test_resp_asan
 	./$(BUILD)/test_resp_asan
+	$(CC) $(CFLAGS) $(SAN_FLAGS) tests/test_queue.c src/queue.c -o $(BUILD)/test_queue_asan
+	./$(BUILD)/test_queue_asan
 
 # LEAKS: AddressSanitizer can't detect leaks on macOS, so use the built-in 'leaks' tool.
 # It runs the tests and reports heap memory still allocated at exit (exit code 1 = leaks found).
-leaks: $(BUILD)/test_database $(BUILD)/test_resp
+leaks: $(BUILD)/test_database $(BUILD)/test_resp $(BUILD)/test_queue
 	leaks --atExit -- ./$(BUILD)/test_database
 	leaks --atExit -- ./$(BUILD)/test_resp
+	leaks --atExit -- ./$(BUILD)/test_queue
 
 # OS DETECTION: 'uname -s' prints "Darwin" on macOS and "Linux" on Linux.
 # On Linux, AddressSanitizer includes LeakSanitizer, so 'make asan' already fails on leaks
@@ -86,7 +94,7 @@ integration: $(BUILD)/server
 # Same integration test, against a server built with AddressSanitizer + UBSan. Catches memory errors in the
 # event loop and the command code: on the first error the server aborts, and the remaining tests fail.
 integration-asan: src/*.c src/*.h | $(BUILD)
-	$(CC) $(CFLAGS) $(SAN_FLAGS) src/main.c src/server.c src/database.c src/resp.c -o $(BUILD)/server_asan
+	$(CC) $(CFLAGS) $(SAN_FLAGS) src/main.c src/server.c src/database.c src/resp.c src/queue.c -o $(BUILD)/server_asan
 	python3 tests/integration_test.py ./$(BUILD)/server_asan
 
 clean:

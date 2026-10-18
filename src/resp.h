@@ -46,5 +46,7 @@ int resp_write_error(RespBuf *b, const char *msg);               // -ERR <msg>\r
 int resp_write_bulk(RespBuf *b, const char *data, size_t len);   // $<len>\r\n<data>\r\n
 int resp_write_null(RespBuf *b);                                 // $-1\r\n
 int resp_write_integer(RespBuf *b, long n);                      // :<n>\r\n
+// Starts an array of 'count' replies: *<count>\r\n. The caller then writes exactly 'count' replies after it.
+int resp_write_array_header(RespBuf *b, long count);             // *<count>\r\n
 
 #endif

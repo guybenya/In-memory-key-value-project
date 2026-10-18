@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <poll.h>
 #include <fcntl.h>
+#include <time.h>
 
 
 
@@ -130,19 +131,165 @@ static int write_arity_error(RespBuf *out, const char *command) {
     return resp_write_error(out, msg);
 }
 
-// AUTHOR: Claude
-// Runs one parsed command against the database and appends its RESP reply to 'out'.
-// Returns 0 on success, -1 if memory ran out (the caller drops the connection).
-static int execute_command(HashTable *db, const RespCommand *cmd, RespBuf *out) {
-    // NULL BYTES: the database stores C strings, which end at the first '\0'.
-    // A value containing '\0' would be cut silently - so refuse it with a clear error instead.
-    for (int i = 0; i < cmd->argc; i++) {
-        if (memchr(cmd->argv[i], '\0', cmd->argv_len[i]) != NULL) {
-            return resp_write_error(out, "null bytes in arguments are not supported");
+// ---------------------------------------------------------------------------------------------
+// QUEUE COMMANDS - thin wrappers: check the arguments, call the queue core (queue.c), write the reply.
+// ---------------------------------------------------------------------------------------------
+
+// AUTHOR: Claude (everything from here down to execute_command)
+
+// Longest visibility timeout a worker may ask for (one day).
+#define MAX_RESERVE_TIMEOUT_SEC 86400
+
+// Returns the current time in milliseconds, from a MONOTONIC clock.
+// Monotonic = it only moves forward and is not the time of day. The normal clock can jump (e.g. when the
+// computer syncs its time), and a jump forward would make every reserved job expire at once.
+static long long now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+// Reads argument 'i' as a whole number made only of digits (e.g. "30" or "17").
+// Returns 0 on success, -1 if it is empty, contains anything but digits, or is too long.
+// Written by hand (not strtol) because the argument is NOT null-terminated.
+static int arg_to_u64(const RespCommand *cmd, int i, uint64_t *out) {
+    size_t len = cmd->argv_len[i];
+    // At most 19 digits: every 19-digit number fits in 64 bits, so the loop below can't overflow.
+    if (len == 0 || len > 19) {
+        return -1;
+    }
+    uint64_t value = 0;
+    for (size_t k = 0; k < len; k++) {
+        char ch = cmd->argv[i][k];
+        if (ch < '0' || ch > '9') {
+            return -1;
         }
+        value = value * 10 + (uint64_t)(ch - '0');
+    }
+    *out = value;
+    return 0;
+}
+
+// Checks that argument 'i' is a valid queue name (1 to QUEUE_MAX_NAME bytes). Returns 1 if it is.
+// If it isn't, writes the error reply, puts that write's result (0 or -1) in *rc, and returns 0 -
+// the caller then returns *rc right away.
+static int check_queue_name(const RespCommand *cmd, int i, RespBuf *out, int *rc) {
+    if (cmd->argv_len[i] >= 1 && cmd->argv_len[i] <= QUEUE_MAX_NAME) {
+        return 1;
+    }
+    char msg[64];
+    snprintf(msg, sizeof(msg), "queue name must be 1 to %d bytes", QUEUE_MAX_NAME);
+    *rc = resp_write_error(out, msg);
+    return 0;
+}
+
+// PUSH queue payload -> :<job id>
+// Adds a job to the end of the queue (the queue is created by its first PUSH).
+static int cmd_push(JobStore *jobs, const RespCommand *cmd, RespBuf *out) {
+    int rc;
+    if (cmd->argc != 3) {
+        return write_arity_error(out, "push");
+    }
+    if (!check_queue_name(cmd, 1, out, &rc)) {
+        return rc;
+    }
+    uint64_t id = js_push(jobs, cmd->argv[1], cmd->argv_len[1], cmd->argv[2], cmd->argv_len[2]);
+    if (id == 0) {
+        return -1;      // out of memory
+    }
+    TRACE("    job %llu pushed to '%.*s'", (unsigned long long)id, (int)cmd->argv_len[1], cmd->argv[1]);
+    return resp_write_integer(out, (long)id);
+}
+
+// RESERVE queue timeout-seconds -> *3 :<id> $<payload> :<attempts>, or (nil) if the queue is empty.
+// Hands the oldest waiting job to this worker and hides it from other workers for 'timeout' seconds.
+// If the worker doesn't ACK it in time (e.g. it crashed), the job goes back to the queue.
+static int cmd_reserve(JobStore *jobs, const RespCommand *cmd, RespBuf *out) {
+    int rc;
+    if (cmd->argc != 3) {
+        return write_arity_error(out, "reserve");
+    }
+    if (!check_queue_name(cmd, 1, out, &rc)) {
+        return rc;
+    }
+    uint64_t seconds;
+    if (arg_to_u64(cmd, 2, &seconds) < 0 || seconds < 1 || seconds > MAX_RESERVE_TIMEOUT_SEC) {
+        return resp_write_error(out, "timeout must be a whole number of seconds from 1 to 86400");
     }
 
+    Job *job = js_reserve(jobs, cmd->argv[1], cmd->argv_len[1], now_ms(), (long long)seconds * 1000);
+    if (job == NULL) {
+        return resp_write_null(out);    // empty queue - the worker waits a little and asks again
+    }
+    TRACE("    job %llu reserved from '%.*s' (attempt %d, timeout %llu s)", (unsigned long long)job->id,
+          (int)cmd->argv_len[1], cmd->argv[1], job->attempts, (unsigned long long)seconds);
+
+    // POINTER: 'job' belongs to the store - copy what we need into the reply now.
+    if (resp_write_array_header(out, 3) < 0) return -1;
+    if (resp_write_integer(out, (long)job->id) < 0) return -1;
+    if (resp_write_bulk(out, job->data, job->len) < 0) return -1;
+    return resp_write_integer(out, job->attempts);
+}
+
+// ACK id -> :1 if the job was deleted, :0 if there is no such job.
+// The worker calls it after finishing a job, so the job is never handed out again.
+static int cmd_ack(JobStore *jobs, const RespCommand *cmd, RespBuf *out) {
+    if (cmd->argc != 2) {
+        return write_arity_error(out, "ack");
+    }
+    uint64_t id;
+    if (arg_to_u64(cmd, 1, &id) < 0) {
+        return resp_write_error(out, "invalid job id");
+    }
+    int deleted = js_ack(jobs, id);
+    TRACE("    job %llu %s", (unsigned long long)id, deleted ? "acked" : "not found");
+    return resp_write_integer(out, deleted);
+}
+
+// Appends one "name, number" pair to a STATS reply.
+static int write_stat(RespBuf *out, const char *name, long value) {
+    if (resp_write_bulk(out, name, strlen(name)) < 0) return -1;
+    return resp_write_integer(out, value);
+}
+
+// STATS queue -> *8 "ready" :n "reserved" :n "acked" :n "dead" :n
+// Reports how many jobs of the queue are waiting, being processed, finished, and given up.
+static int cmd_stats(JobStore *jobs, const RespCommand *cmd, RespBuf *out) {
+    int rc;
+    if (cmd->argc != 2) {
+        return write_arity_error(out, "stats");
+    }
+    if (!check_queue_name(cmd, 1, out, &rc)) {
+        return rc;
+    }
+    QueueStats st;
+    js_stats(jobs, cmd->argv[1], cmd->argv_len[1], &st);
+    if (resp_write_array_header(out, 8) < 0) return -1;
+    if (write_stat(out, "ready", (long)st.ready) < 0) return -1;
+    if (write_stat(out, "reserved", (long)st.reserved) < 0) return -1;
+    if (write_stat(out, "acked", (long)st.acked) < 0) return -1;
+    return write_stat(out, "dead", (long)st.dead);
+}
+
+// AUTHOR: Claude
+// Runs one parsed command and appends its RESP reply to 'out': picks the command by its name
+// and passes it to the key-value store or to the job queues.
+// Returns 0 on success, -1 if memory ran out (the caller drops the connection).
+static int execute_command(ServerState *state, const RespCommand *cmd, RespBuf *out) {
+    HashTable *db = state->db;
+
     TRACE("    execute %.*s (%d args)", cmd->argv_len[0] > 32 ? 32 : (int)cmd->argv_len[0], cmd->argv[0], cmd->argc);
+
+    // NULL BYTES: the key-value database stores C strings, which end at the first '\0'.
+    // A value containing '\0' would be cut silently - so refuse it with a clear error instead.
+    // Only SET/GET/DEL have this limit: queue payloads are stored together with their length.
+    if (arg_is(cmd, 0, "SET") || arg_is(cmd, 0, "GET") || arg_is(cmd, 0, "DEL")) {
+        for (int i = 0; i < cmd->argc; i++) {
+            if (memchr(cmd->argv[i], '\0', cmd->argv_len[i]) != NULL) {
+                return resp_write_error(out, "null bytes in arguments are not supported");
+            }
+        }
+    }
 
     // PING -> +PONG. Clients use it to check that the server is alive.
     if (arg_is(cmd, 0, "PING")) {
@@ -211,6 +358,20 @@ static int execute_command(HashTable *db, const RespCommand *cmd, RespBuf *out) 
         return resp_write_integer(out, deleted);
     }
 
+    // Job queue commands.
+    if (arg_is(cmd, 0, "PUSH")) {
+        return cmd_push(state->jobs, cmd, out);
+    }
+    if (arg_is(cmd, 0, "RESERVE")) {
+        return cmd_reserve(state->jobs, cmd, out);
+    }
+    if (arg_is(cmd, 0, "ACK")) {
+        return cmd_ack(state->jobs, cmd, out);
+    }
+    if (arg_is(cmd, 0, "STATS")) {
+        return cmd_stats(state->jobs, cmd, out);
+    }
+
     // Anything else. "%.*s" prints at most N chars of a NOT null-terminated string (N comes first).
     // The name is capped at 32 chars so a huge garbage command can't make a huge error message.
     char msg[96];
@@ -228,7 +389,8 @@ static int execute_command(HashTable *db, const RespCommand *cmd, RespBuf *out) 
 // and removes the handled bytes from the front of 'in'. A partial command stays in 'in' for next time.
 // Returns  0 - fine (the connection stays open).
 // Returns -1 - protocol error (an error reply was already added to 'out') or out of memory -> close the connection.
-static int process_input(HashTable *db, RespBuf *in, RespBuf *out) {
+// (Stage 3, by Claude: the first parameter changed from HashTable* to ServerState*, nothing else.)
+static int process_input(ServerState *state, RespBuf *in, RespBuf *out) {
     // STEP 1: 'start' = offset of the first byte that hasn't been handled yet.
     size_t start = 0;
     // STEP 2: Loop - parse one command starting at in->data + start (there are in->len - start bytes left):
@@ -248,7 +410,7 @@ static int process_input(HashTable *db, RespBuf *in, RespBuf *out) {
         }
         if (rc == 1)
         {
-            if (execute_command(db, &cmd, out) == -1) {return -1;}
+            if (execute_command(state, &cmd, out) == -1) {return -1;}
             start += consumed;
         }
     }
@@ -406,7 +568,7 @@ static int flush_output(int i) {
 // Client i's socket has data: read ONE chunk, run every complete command, and try to send the replies.
 // One read per wake-up keeps it fair - a client sending a lot can't starve the others.
 // Returns 0 if the client is still open, -1 if it was closed.
-static int handle_readable(int i, HashTable *db) {
+static int handle_readable(int i, ServerState *state) {
     Client *c = &clients[i];
     // STACK ALLOCATION: temporary landing area for this read().
     char chunk[READ_CHUNK];
@@ -430,9 +592,9 @@ static int handle_readable(int i, HashTable *db) {
         return -1;
     }
 
-    // Guy's process_input - unchanged from the one-client version. It never touches the socket, only buffers,
-    // which is exactly why it works as-is inside an event loop.
-    if (process_input(db, &c->in, &c->out) < 0) {
+    // Guy's process_input - the same logic as in the one-client version. It never touches the socket, only
+    // buffers, which is exactly why it works as-is inside an event loop.
+    if (process_input(state, &c->in, &c->out) < 0) {
         c->closing = 1;     // stop reading; flush_output closes the connection after the error reply is out
     } else if (c->in.len > MAX_INPUT_BUFFER) {
         close_client(i, "input too large");
@@ -446,7 +608,13 @@ static int handle_readable(int i, HashTable *db) {
     return flush_output(i);
 }
 
-void run_event_loop(int listen_fd, HashTable *db) {
+// How often reserved jobs are checked for an expired deadline. Deadlines are whole seconds,
+// so being up to 0.1 s late is fine.
+#define EXPIRY_CHECK_MS 100
+
+// Runs the server forever: waits for events with poll(), hands each ready socket to its handler,
+// and regularly returns expired jobs to their queues.
+void run_event_loop(int listen_fd, ServerState *state) {
     trace_on = getenv("KV_TRACE") != NULL;
 
     if (set_nonblocking(listen_fd) < 0) {
@@ -458,6 +626,9 @@ void run_event_loop(int listen_fd, HashTable *db) {
     nfds = 1;
 
     printf("Waiting for connections... \n");
+
+    // When the next check for expired jobs is due (see STEP 5).
+    long long next_expiry_check = 0;
 
     while (1) {
         // STEP 1: Tell poll() what to wait for, per client.
@@ -472,9 +643,12 @@ void run_event_loop(int listen_fd, HashTable *db) {
             }
         }
 
-        // STEP 2: SYSTEM CALL poll() - sleep until at least one socket is ready. -1 = no timeout.
+        // STEP 2: SYSTEM CALL poll() - sleep until at least one socket is ready.
         // The OS fills fds[i].revents with what happened to each socket.
-        int ready = poll(fds, (nfds_t)nfds, -1);
+        // TIMEOUT: if jobs are reserved, wake up at least every EXPIRY_CHECK_MS even when no client does
+        // anything - a crashed worker sends nothing, yet its job must come back. Otherwise -1 = no timeout.
+        int timeout = state->jobs->reserved_total > 0 ? EXPIRY_CHECK_MS : -1;
+        int ready = poll(fds, (nfds_t)nfds, timeout);
         if (ready < 0) {
             if (errno == EINTR) {
                 continue;
@@ -482,7 +656,9 @@ void run_event_loop(int listen_fd, HashTable *db) {
             perror("poll failed");
             exit(EXIT_FAILURE);
         }
-        TRACE("poll: %d socket(s) ready", ready);
+        if (ready > 0) {
+            TRACE("poll: %d socket(s) ready", ready);
+        }
 
         // STEP 3: New connections.
         if (fds[0].revents & POLLIN) {
@@ -501,7 +677,7 @@ void run_event_loop(int listen_fd, HashTable *db) {
             }
             // POLLHUP = the client hung up. read() then returns 0 (or the last bytes it sent), so read handles it.
             if ((ev & (POLLIN | POLLHUP)) && !clients[i].closing) {
-                if (handle_readable(i, db) < 0) {
+                if (handle_readable(i, state) < 0) {
                     continue;
                 }
             }
@@ -515,6 +691,19 @@ void run_event_loop(int listen_fd, HashTable *db) {
                 continue;
             }
             i++;
+        }
+
+        // STEP 5: Visibility timeout. Return jobs whose worker didn't ACK in time to their queue.
+        // Done at most every EXPIRY_CHECK_MS, so a busy server doesn't scan the reserved jobs on every event.
+        if (state->jobs->reserved_total > 0) {
+            long long now = now_ms();
+            if (now >= next_expiry_check) {
+                int moved = js_expire(state->jobs, now);
+                if (moved > 0) {
+                    TRACE("expired: %d job(s) returned to their queue (or marked dead)", moved);
+                }
+                next_expiry_check = now + EXPIRY_CHECK_MS;
+            }
         }
     }
 }

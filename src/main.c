@@ -55,9 +55,19 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    // HEAP ALLOCATION: the job queues. OWNER: main(), for the whole run - like the database.
+    JobStore *jobs = js_create();
+    if (jobs == NULL) {
+        perror("Failed to create job store");
+        return 1;
+    }
+
+    // Everything the commands work on, handed to the event loop in one struct.
+    ServerState state = { .db = db, .jobs = jobs };
+
     // EVENT LOOP: accepts clients and serves all of them at once. It never returns -
     // the server runs until the process is stopped (e.g. Ctrl+C).
-    run_event_loop(server_fd, db);
+    run_event_loop(server_fd, &state);
 
     return 0;
 }
