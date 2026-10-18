@@ -1,8 +1,10 @@
 #include "server.h"
 #include "database.h"
+#include "resp.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -90,133 +92,220 @@ static int send_all(int fd, const char *buf, size_t len) {
 }
 
 
-void handle_client(int client_fd, HashTable *db) {
-    // POINTER: buffer pointsto dynamically allocated memory from the heap. 
-    // OWNER: handle_client is the owner and must free this memory at the end. 
-    char *buffer = (char *)malloc(1024);
+// ---------------------------------------------------------------------------------------------
+// COMMANDS
+// ---------------------------------------------------------------------------------------------
 
-    if (buffer == NULL) {
-        perror("Allocation failed");
-        return;
-    }
-
-    while (1) { // C version for while(true)
-
-        // initializing a block of memory in one opetation - filling the array with zeros
-        // in order not to print old leftovers text from the memory.  
-        memset(buffer,0,1024);
-        
-        // SYSTEM CALL: read()
-        // 1023 is the last index in the array - prevents reading from an undifined cell.
-        ssize_t bytes_read = read(client_fd,buffer,1023);
-        
-        // If the client disconnects or an error occurs, we break out the loop. 
-        if (bytes_read <= 0) {
-            break;
-        }
-
-        // REPLY: Each command branch below only CHOOSES the reply - a single send at the end of the loop sends it.
-        // POINTER: 'reply' points either to a string literal (read-only memory) or to 'response_buf'.
-        // NULL means "nothing to send" (e.g. an empty line).
-        const char *reply = NULL;
-
-        // STACK ALLOCATION: Declared at the loop level (not inside the GET branch) on purpose -
-        // 'reply' may point to it, and it must still exist when the reply is sent at the end of the loop.
-        // A buffer declared inside the GET block would be gone by then (dangling pointer).
-        char response_buf[1024];
-
-        // STACK - POINTER: tracks the current parsing position for the strtok_r.
-        char *saveptr;
-
-        // FUNCTION: strtok_r(string, delimiters, state)
-        // Splits the string into words (tokens).
-        // Modifies the original buffer by inserting null-terminators ('\0') at the
-        // end of each found word.
-        // HEAP - POINTER: points directly to the first word INSIDE the existing heap buffer
-        // There is no new memory allocation here.
-        char *command = strtok_r(buffer, "\r\n ", &saveptr);
-
-        if (command != NULL) {
-            // FUNCTION: strcmp(string1, string2)
-            // Compares two strings character by character.
-            // It is the equivalent of 'equals()' in Java.
-            // Returns 0 if they are exactly identical.
-            if (strcmp(command, "SET") == 0) {
-                // Passing NULL to strtok_r tells it to
-                // continue parsing from where it left off.
-                // POINTERS: key and value point to the
-                // next words inside the same heap buffer.
-                char *key = strtok_r (NULL, "\r\n ", &saveptr);
-                char *value = strtok_r (NULL, "\r\n ", &saveptr);
-
-                if (key != NULL && value != NULL) {
-                    if (db_set(db, key,value) == 0) {
-                        reply = "OK - Saved to database\n";
-                    }
-                    else {
-                        reply = "ERROR - Failed to save \n";
-                    }
-                }
-                else {
-                    reply = "ERROR - Usage: SET <key> <value> \n";
-                }
-            }
-            else if (strcmp(command, "GET") == 0) {
-
-                char *key = strtok_r (NULL, "\r\n " , &saveptr);
-
-                if (key != NULL) {
-                    // RETRIVE FROM DATABASE
-                    // POINTER: 'result' points to the existing string inside the database's heap memory.
-                    char *result = db_get(db, key);
-
-                    if (result != NULL) {
-                        // FUNCTION: snprintf securely formats strings. It combines "VALUE: " with the retrieved string.
-                        snprintf(response_buf, sizeof(response_buf), "VALUE: %s\n", result);
-                        reply = response_buf;
-                    }
-                    else {
-                        reply = "ERROR - Key not found\n";
-                    }
-                }
-                else {
-                    reply = "ERROR - Usage: GET <key> \n";
-                }
-            }
-            else if (strcmp(command, "DEL") == 0) {
-                char *key = strtok_r (NULL, "\r\n " , &saveptr);
-                if (key != NULL) {
-                    if (db_delete(db,key) == 1) {
-                        reply = "OK - Deleted\n";
-                    }
-                    else {
-                        reply = "ERROR - Key not found\n";
-                    }
-                }
-                else {
-                    reply = "ERROR - Usage: DEL <key>\n";
-                }
-            }
-            else {
-                reply = "ERROR - Unknown command\n";
-            }
-        }
-
-        // SEND: One place that sends the chosen reply. send_all retries until every byte is written.
-        // If it fails (e.g. the client disconnected), stop serving this client - the connection is dead.
-        if (reply != NULL) {
-            if (send_all(client_fd, reply, strlen(reply)) < 0) {
-                break;
-            }
-        }
-    }
-    // FUNCTION: free(pointer)
-    // HEAP DEALLOCATION: Releases the memory 
-    // block back to the Operating System.
-    // Since Java has a Garbage Collector, you 
-    // never do this there, but in C it is 
-    // mandatory to prevent memory leaks.
-    free(buffer);
+// AUTHOR: Claude
+// Checks whether argument 'i' is the word 'name', ignoring upper/lower case (Redis accepts "get" and "GET").
+// strncasecmp compares at most n chars - needed because the arguments are NOT null-terminated.
+static int arg_is(const RespCommand *cmd, int i, const char *name) {
+    size_t n = strlen(name);
+    return cmd->argv_len[i] == n && strncasecmp(cmd->argv[i], name, n) == 0;
 }
 
+// AUTHOR: Claude
+// Copies argument 'i' into a new null-terminated C string, because db_set/db_get expect C strings.
+// HEAP ALLOCATION - OWNER: the caller must free() it. Returns NULL if memory ran out.
+static char *arg_to_cstr(const RespCommand *cmd, int i) {
+    char *s = malloc(cmd->argv_len[i] + 1);
+    if (s == NULL) {
+        return NULL;
+    }
+    memcpy(s, cmd->argv[i], cmd->argv_len[i]);
+    s[cmd->argv_len[i]] = '\0';
+    return s;
+}
 
+// AUTHOR: Claude
+// Writes the standard Redis error for a command with the wrong number of arguments.
+static int write_arity_error(RespBuf *out, const char *command) {
+    char msg[64];
+    snprintf(msg, sizeof(msg), "wrong number of arguments for '%s' command", command);
+    return resp_write_error(out, msg);
+}
+
+// AUTHOR: Claude
+// Runs one parsed command against the database and appends its RESP reply to 'out'.
+// Returns 0 on success, -1 if memory ran out (the caller drops the connection).
+static int execute_command(HashTable *db, const RespCommand *cmd, RespBuf *out) {
+    // NULL BYTES: the database stores C strings, which end at the first '\0'.
+    // A value containing '\0' would be cut silently - so refuse it with a clear error instead.
+    for (int i = 0; i < cmd->argc; i++) {
+        if (memchr(cmd->argv[i], '\0', cmd->argv_len[i]) != NULL) {
+            return resp_write_error(out, "null bytes in arguments are not supported");
+        }
+    }
+
+    // PING -> +PONG. Clients use it to check that the server is alive.
+    if (arg_is(cmd, 0, "PING")) {
+        if (cmd->argc != 1) {
+            return write_arity_error(out, "ping");
+        }
+        return resp_write_simple(out, "PONG");
+    }
+
+    // SET key value -> +OK
+    if (arg_is(cmd, 0, "SET")) {
+        if (cmd->argc != 3) {
+            return write_arity_error(out, "set");
+        }
+        char *key = arg_to_cstr(cmd, 1);
+        char *value = arg_to_cstr(cmd, 2);
+        if (key == NULL || value == NULL) {
+            free(key);      // free(NULL) is safe, so no need to check which one failed
+            free(value);
+            return -1;
+        }
+        // db_set makes its own copies (strdup), so our temporary strings can be freed right away.
+        int rc = db_set(db, key, value);
+        free(key);
+        free(value);
+        if (rc != 0) {
+            return resp_write_error(out, "failed to save");
+        }
+        return resp_write_simple(out, "OK");
+    }
+
+    // GET key -> $<len>\r\n<value>\r\n, or $-1\r\n (null) if the key doesn't exist
+    if (arg_is(cmd, 0, "GET")) {
+        if (cmd->argc != 2) {
+            return write_arity_error(out, "get");
+        }
+        char *key = arg_to_cstr(cmd, 1);
+        if (key == NULL) {
+            return -1;
+        }
+        // POINTER: 'value' points INTO the database's memory - read it, don't free it.
+        char *value = db_get(db, key);
+        free(key);
+        if (value == NULL) {
+            return resp_write_null(out);
+        }
+        return resp_write_bulk(out, value, strlen(value));
+    }
+
+    // DEL key [key ...] -> :<number of keys that were actually deleted>
+    if (arg_is(cmd, 0, "DEL")) {
+        if (cmd->argc < 2) {
+            return write_arity_error(out, "del");
+        }
+        long deleted = 0;
+        for (int i = 1; i < cmd->argc; i++) {
+            char *key = arg_to_cstr(cmd, i);
+            if (key == NULL) {
+                return -1;
+            }
+            if (db_delete(db, key) == 1) {
+                deleted++;
+            }
+            free(key);
+        }
+        return resp_write_integer(out, deleted);
+    }
+
+    // Anything else. "%.*s" prints at most N chars of a NOT null-terminated string (N comes first).
+    // The name is capped at 32 chars so a huge garbage command can't make a huge error message.
+    char msg[96];
+    int name_len = cmd->argv_len[0] > 32 ? 32 : (int)cmd->argv_len[0];
+    snprintf(msg, sizeof(msg), "unknown command '%.*s'", name_len, cmd->argv[0]);
+    return resp_write_error(out, msg);
+}
+
+// ---------------------------------------------------------------------------------------------
+// CLIENT CONNECTION
+// ---------------------------------------------------------------------------------------------
+
+// AUTHOR: Guy (skeleton by Claude)
+// Runs every COMPLETE command in 'in', appends their replies to 'out',
+// and removes the handled bytes from the front of 'in'. A partial command stays in 'in' for next time.
+// Returns  0 - fine (the connection stays open).
+// Returns -1 - protocol error (an error reply was already added to 'out') or out of memory -> close the connection.
+static int process_input(HashTable *db, RespBuf *in, RespBuf *out) {
+    // STEP 1: 'start' = offset of the first byte that hasn't been handled yet.
+    size_t start = 0;
+    // STEP 2: Loop - parse one command starting at in->data + start (there are in->len - start bytes left):
+    //   incomplete (0)  -> stop the loop, wait for more bytes
+    //   malformed  (-1) -> append the error reply "Protocol error" and return -1
+    //   complete   (1)  -> execute it (if that returns -1, return -1), then move 'start' past it
+    while (start < in->len) 
+    {
+        RespCommand cmd;
+        size_t consumed;
+        int rc = resp_parse_command(in->data + start, in->len - start, &cmd, &consumed);
+        if (rc == 0) {break;}
+        if (rc == -1)
+        {
+            resp_write_error(out, "Protocol error");
+            return -1;
+        }
+        if (rc == 1)
+        {
+            if (execute_command(db, &cmd, out) == -1) {return -1;}
+            start += consumed;
+        }
+    }
+    // STEP 3: Remove the handled bytes: move what's left (the partial command, if any) to the front of
+    //         in->data, and update in->len. Do this AFTER the loop - the commands point INTO this buffer.
+    if (start > 0) {
+        size_t remaining = in->len - start;
+        memmove(in->data, in->data + start, remaining);
+        in->len = remaining;
+    }
+
+    // STEP 4: Success.
+    return 0;
+}
+
+// AUTHOR: Claude (READ_CHUNK, MAX_INPUT_BUFFER, handle_client)
+// Bytes read from the socket per read() call.
+#define READ_CHUNK 4096
+
+// LIMIT: the biggest legal command is RESP_MAX_ARGS arguments of RESP_MAX_BULK_LEN bytes each, plus headers.
+// A client whose unfinished input grows beyond that is broken or malicious - disconnect it,
+// otherwise it could make the server buffer memory forever.
+#define MAX_INPUT_BUFFER (RESP_MAX_ARGS * (RESP_MAX_BULK_LEN + 32) + 32)
+
+void handle_client(int client_fd, HashTable *db) {
+    // BUFFERS: 'in' collects bytes until they form complete commands, 'out' collects replies.
+    // Both start empty and grow as needed. OWNER: handle_client - freed at the end.
+    RespBuf in = {0};
+    RespBuf out = {0};
+
+    // STACK ALLOCATION: temporary landing area for each read().
+    char chunk[READ_CHUNK];
+
+    while (1) {
+        // SYSTEM CALL: read() - blocks until the client sends something.
+        ssize_t n = read(client_fd, chunk, sizeof(chunk));
+        if (n < 0 && errno == EINTR) {
+            continue;   // interrupted by a signal before any data arrived - just try again
+        }
+        if (n <= 0) {
+            break;      // 0 = the client closed the connection, < 0 = error
+        }
+
+        if (resp_buf_append(&in, chunk, (size_t)n) < 0) {
+            break;      // out of memory
+        }
+
+        // Run all complete commands. Replies pile up in 'out' - one per command, in order.
+        int rc = process_input(db, &in, &out);
+
+        // SEND: all replies at once - one send for many pipelined commands.
+        // Sent even when rc == -1, so the client gets the "Protocol error" reply before we hang up.
+        if (out.len > 0) {
+            if (send_all(client_fd, out.data, out.len) < 0) {
+                break;  // the client is gone
+            }
+            out.len = 0;    // keep the memory, reuse it for the next replies
+        }
+
+        if (rc < 0 || in.len > MAX_INPUT_BUFFER) {
+            break;
+        }
+    }
+
+    resp_buf_free(&in);
+    resp_buf_free(&out);
+}
