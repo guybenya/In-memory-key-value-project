@@ -68,8 +68,7 @@ def free_port():
 
 # AUTHOR: Claude
 class Connection:
-    """One client connection. Use with 'with' so it is always closed -
-    the server still serves ONE client at a time, so the next test can only connect after this one closes."""
+    """One client connection. Use with 'with' so it is always closed, even when a test fails."""
 
     def __init__(self, port):
         self.sock = socket.create_connection(("127.0.0.1", port), timeout=TIMEOUT)
@@ -219,6 +218,57 @@ class ServerTest(unittest.TestCase):
         # The server itself is fine and accepts the next client.
         with self.connect() as c:
             self.assertEqual(c.call("PING"), "PONG")
+
+    # --- Many clients at once (the poll() event loop) ---
+
+    def test_two_clients_interleaved(self):
+        with self.connect() as a, self.connect() as b:
+            self.assertEqual(a.call("SET", "shared", "from-a"), "OK")
+            self.assertEqual(b.call("GET", "shared"), b"from-a")      # b sees a's write
+            self.assertEqual(b.call("SET", "shared", "from-b"), "OK")
+            self.assertEqual(a.call("GET", "shared"), b"from-b")
+
+    def test_stuck_client_does_not_block_others(self):
+        # 'a' sends HALF a command and goes quiet. With the old blocking server, 'b' would hang here forever.
+        cmd = encode_command("SET", "half", "done")
+        with self.connect() as a, self.connect() as b:
+            a.send_raw(cmd[:10])
+            self.assertEqual(b.call("PING"), "PONG")
+            self.assertEqual(b.call("SET", "other", "x"), "OK")
+            a.send_raw(cmd[10:])                                     # now 'a' finishes its command
+            self.assertEqual(a.read_reply(), "OK")
+            self.assertEqual(b.call("GET", "half"), b"done")
+
+    def test_many_clients(self):
+        # 50 connections open at the same time, each with its own key.
+        conns = [self.connect() for _ in range(50)]
+        try:
+            for i, c in enumerate(conns):
+                self.assertEqual(c.call("SET", "worker:%d" % i, "job-%d" % i), "OK")
+            for i, c in enumerate(conns):
+                self.assertEqual(c.call("GET", "worker:%d" % i), b"job-%d" % i)
+        finally:
+            for c in conns:
+                c.__exit__()
+
+    def test_client_disconnects_mid_command(self):
+        # A client that leaves in the middle of a command must not crash the server or leave it stuck.
+        with self.connect() as a:
+            a.send_raw(encode_command("SET", "k", "v")[:7])
+        with self.connect() as b:
+            self.assertEqual(b.call("PING"), "PONG")
+
+    def test_slow_reader_does_not_block_others(self):
+        # 'slow' asks for ~20 MB of replies and doesn't read them. The OS socket buffers fill up, so the
+        # server must keep the rest and send it later (POLLOUT) - while still serving 'fast' in the meantime.
+        value = b"x" * 1000000
+        with self.connect() as slow, self.connect() as fast:
+            self.assertEqual(slow.call("SET", "huge", value), "OK")
+            slow.send_raw(encode_command("GET", "huge") * 20)        # 20 GETs, no reading
+            time.sleep(0.2)
+            self.assertEqual(fast.call("PING"), "PONG")              # the server is not stuck on 'slow'
+            for _ in range(20):                                      # now 'slow' reads everything, intact
+                self.assertEqual(slow.read_reply(), value)
 
 
 if __name__ == "__main__":
