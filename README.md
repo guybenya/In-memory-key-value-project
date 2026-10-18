@@ -1,12 +1,14 @@
-# In-Memory Key-Value Server (on its way to a job queue)
+# Job Queue Server in C
 
 [![CI](https://github.com/guybenya/In-memory-key-value-project/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/guybenya/In-memory-key-value-project/actions/workflows/ci.yml)
 
-A TCP server written in C that stores key-value pairs in memory, using a hash table with separate chaining.
+A job-queue server written in C, in the style of Beanstalkd. Producers push jobs into named queues, workers
+reserve and acknowledge them, and a job whose worker crashes goes back to the queue automatically. The server
+also has a small key-value store (`SET` / `GET` / `DEL`), where the project started.
 
-This is the first stage of a larger project: the KV store is going to become the internal storage of a
-**durable job-queue server** (in the style of Beanstalkd), with a Python client library and worker framework
-on top of it. See the [Roadmap](#roadmap).
+It speaks the Redis protocol, serves many clients at once from a single-threaded `poll()` event loop, and is
+tested in CI on Linux and macOS. A Python client library, a worker framework and an example app (batch
+analysis of protein sequences) are next. See the [Roadmap](#roadmap).
 
 ## Build and run
 
@@ -25,7 +27,51 @@ protocol, so any Redis client can talk to it. Connect from another terminal with
 redis-cli -p 8080
 ```
 
-## Commands
+## Job queue
+
+| Command                     | Reply                                                                      |
+|-----------------------------|----------------------------------------------------------------------------|
+| `PUSH <queue> <payload>`    | The new job's id. Adds the job to the end of the queue.                    |
+| `RESERVE <queue> <seconds>` | `[id, payload, attempts]` for the oldest waiting job, or `(nil)` if none.  |
+| `ACK <id>`                  | `1` if the job was deleted, `0` if there is no job with that id.           |
+| `STATS <queue>`             | Counts: `ready`, `reserved`, `acked` and `dead`.                           |
+
+A queue is created by its first `PUSH`. Queue names are 1 to 64 bytes, and payloads may contain any bytes.
+
+**The life of a job:**
+
+1. `PUSH` puts the job at the end of the queue (*ready*).
+2. `RESERVE` hands the oldest ready job to a worker and hides it from all other workers for the given
+   number of seconds, the *visibility timeout* (*reserved*). `attempts` counts how many times the job has
+   been reserved, so a worker can tell a retry from a first try.
+3. When the worker finishes, it sends `ACK`, and the job is deleted.
+4. If the worker does not `ACK` in time, for example because it crashed or hung, the server puts the job
+   back at the end of the queue and another worker gets it. The server checks deadlines ten times a second,
+   even when no client sends anything.
+5. A job that has been reserved 5 times without an `ACK` is moved to *dead* and not handed out again, so
+   one job that crashes every worker cannot circulate forever.
+
+**Delivery guarantee: at least once.** No job is lost when a worker crashes, but a job can be processed
+twice: a worker that is slower than its timeout loses the job to another worker, and both finish it.
+Workers should therefore write their results so that writing the same result twice does no harm (for
+example, insert-or-replace by job id). A late `ACK` is still accepted and deletes the job, wherever it is.
+
+Example session with a producer and a worker:
+
+```
+127.0.0.1:8080> PUSH proteins "batch-001.fasta"
+(integer) 1
+127.0.0.1:8080> RESERVE proteins 30
+1) (integer) 1
+2) "batch-001.fasta"
+3) (integer) 1
+127.0.0.1:8080> ACK 1
+(integer) 1
+127.0.0.1:8080> RESERVE proteins 30
+(nil)
+```
+
+## Key-value commands
 
 Command names are case-insensitive (`get` works like `GET`). Keys and values may contain any bytes,
 including spaces and newlines, except the null byte.
@@ -99,7 +145,7 @@ Output for `redis-cli -p 8080 SET name guy`:
 
 | Target          | What it does                                                                                  |
 |-----------------|-----------------------------------------------------------------------------------------------|
-| `make test`     | Builds and runs the unit tests for the hash table and for the RESP parser.                    |
+| `make test`     | Builds and runs the unit tests for the hash table, the RESP parser and the job queue.         |
 | `make asan`     | Rebuilds the tests with AddressSanitizer and UndefinedBehaviorSanitizer and runs them.        |
 | `make leaks`    | Runs the tests under the macOS `leaks` tool and fails if any heap memory is left at exit.     |
 | `make check`    | Runs `test` and `asan`, plus `leaks` on macOS. On Linux, `asan` already detects leaks.        |
@@ -126,8 +172,16 @@ This section is kept honest and up to date. Everything here is planned to be fix
 - **Size limits.** A command can have at most 16 arguments, and each argument at most 1 MB. A client that
   goes over a limit gets a protocol error and is disconnected, so it cannot make the server buffer
   unlimited memory.
-- **No null bytes.** The hash table stores C strings, which end at the first null byte, so arguments that
-  contain one are rejected with an error (rather than silently cut).
+- **No null bytes in keys and values.** The hash table stores C strings, which end at the first null byte,
+  so `SET`, `GET` and `DEL` reject arguments that contain one (rather than silently cutting them). Queue
+  payloads do not have this limit.
+- **`RESERVE` does not wait.** On an empty queue it answers `(nil)` right away, and the worker has to ask
+  again a little later. *(Planned: a blocking `RESERVE` that holds the request until a job arrives.)*
+- **A disconnected worker's job waits for its timeout.** When a worker's connection closes, its reserved job
+  is not returned at once, only when the visibility timeout ends.
+- **Dead jobs can only be counted.** There is no command yet to list, retry or delete them, and the limit
+  of 5 attempts is fixed.
+- **Queues are never deleted**, even when they are empty.
 - **RESP only.** Plain-text "inline" commands (what `nc` or `telnet` would send) are not supported and
   get a protocol error. Use `redis-cli` or any Redis client library.
 - **No persistence.** All data is lost when the server stops. *(Fix: append-only file, stage 5.)*
@@ -138,8 +192,8 @@ This section is kept honest and up to date. Everything here is planned to be fix
    macOS for every push and pull request.
 2. **Protocol and concurrency** *(done)*: RESP, the Redis wire protocol, and a `poll()` event loop that
    serves many clients at once.
-3. **Queue core:** commands to push, reserve and acknowledge jobs, with a visibility timeout that returns
-   jobs of crashed workers to the queue.
+3. **Queue core** *(done)*: commands to push, reserve and acknowledge jobs, with a visibility timeout that
+   returns jobs of crashed workers to the queue, and dead jobs after repeated failures.
 4. **Python client and worker framework**, plus an example app: batch analysis of protein sequences.
    A FASTA file is split into jobs of a few hundred sequences each. Workers validate the sequences
    (invalid characters, empty or duplicate entries), compute their properties (length, molecular weight,

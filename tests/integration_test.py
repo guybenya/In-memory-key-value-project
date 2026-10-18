@@ -55,6 +55,9 @@ def read_reply(f):
         if data[-2:] != b"\r\n":
             raise AssertionError("bulk reply does not end with \\r\\n: %r" % data)
         return data[:-2]
+    if kind == b"*":
+        # An array: a count, then that many replies of any type (read with this same function).
+        return [read_reply(f) for _ in range(int(body))]
     raise AssertionError("unknown reply type: %r" % line)
 
 
@@ -269,6 +272,87 @@ class ServerTest(unittest.TestCase):
             self.assertEqual(fast.call("PING"), "PONG")              # the server is not stuck on 'slow'
             for _ in range(20):                                      # now 'slow' reads everything, intact
                 self.assertEqual(slow.read_reply(), value)
+
+    # --- Job queue ---
+    # Every test uses its own queue name, because all tests share one server.
+
+    def stats(self, conn, queue):
+        """Returns STATS as a dict, e.g. {"ready": 2, "reserved": 0, "acked": 5, "dead": 0}."""
+        reply = conn.call("STATS", queue)
+        return {reply[i].decode(): reply[i + 1] for i in range(0, len(reply), 2)}
+
+    def test_push_reserve_ack(self):
+        with self.connect() as c:
+            job_id = c.call("PUSH", "q-basic", "seq-batch-1")
+            self.assertIsInstance(job_id, int)
+            self.assertEqual(c.call("RESERVE", "q-basic", "30"), [job_id, b"seq-batch-1", 1])
+            self.assertEqual(self.stats(c, "q-basic"), {"ready": 0, "reserved": 1, "acked": 0, "dead": 0})
+            self.assertEqual(c.call("ACK", str(job_id)), 1)
+            self.assertEqual(c.call("ACK", str(job_id)), 0)          # already finished
+            self.assertEqual(self.stats(c, "q-basic"), {"ready": 0, "reserved": 0, "acked": 1, "dead": 0})
+
+    def test_reserve_from_empty_queue(self):
+        with self.connect() as c:
+            self.assertIsNone(c.call("RESERVE", "q-empty", "30"))
+
+    def test_producer_and_worker_are_different_clients(self):
+        # Jobs pushed by one client come out, oldest first, for another client.
+        with self.connect() as producer, self.connect() as worker:
+            for n in range(3):
+                producer.call("PUSH", "q-fifo", "job-%d" % n)
+            for n in range(3):
+                self.assertEqual(worker.call("RESERVE", "q-fifo", "30")[1], b"job-%d" % n)
+
+    def test_binary_payload(self):
+        # Queue payloads are stored with their length, so any byte is allowed - even a null byte.
+        payload = b"\x00\x01 two\r\nlines \xff"
+        with self.connect() as c:
+            c.call("PUSH", "q-binary", payload)
+            self.assertEqual(c.call("RESERVE", "q-binary", "30")[1], payload)
+
+    def test_visibility_timeout(self):
+        # A worker reserves a job for 1 second and never ACKs it (as if it hung or crashed).
+        with self.connect() as stuck_worker, self.connect() as other_worker:
+            job_id = stuck_worker.call("PUSH", "q-timeout", "work")
+            self.assertEqual(stuck_worker.call("RESERVE", "q-timeout", "1")[0], job_id)
+            self.assertIsNone(other_worker.call("RESERVE", "q-timeout", "1"))   # hidden while reserved
+            time.sleep(1.3)
+            # The deadline passed, so the server returned the job - with no client doing anything.
+            self.assertEqual(other_worker.call("RESERVE", "q-timeout", "30"), [job_id, b"work", 2])
+
+    def test_no_job_is_given_to_two_workers(self):
+        # 5 workers take turns reserving 100 jobs: every job goes to exactly one worker.
+        workers = [self.connect() for _ in range(5)]
+        try:
+            for n in range(100):
+                workers[0].call("PUSH", "q-many", "job-%d" % n)
+            seen = []
+            while True:
+                replies = [w.call("RESERVE", "q-many", "30") for w in workers]
+                got = [r for r in replies if r is not None]
+                if not got:
+                    break
+                seen.extend(r[0] for r in got)
+            self.assertEqual(len(seen), 100)
+            self.assertEqual(len(set(seen)), 100)                   # no id twice
+            for job_id in seen:
+                self.assertEqual(workers[1].call("ACK", str(job_id)), 1)
+            self.assertEqual(self.stats(workers[2], "q-many")["acked"], 100)
+        finally:
+            for w in workers:
+                w.__exit__()
+
+    def test_queue_command_errors(self):
+        with self.connect() as c:
+            self.assertError(c.call("RESERVE", "q-err", "0"), "timeout must be")
+            self.assertError(c.call("RESERVE", "q-err", "abc"), "timeout must be")
+            self.assertError(c.call("RESERVE", "q-err", "86401"), "timeout must be")
+            self.assertError(c.call("ACK", "-5"), "invalid job id")
+            self.assertError(c.call("PUSH", "", "x"), "queue name must be")
+            self.assertError(c.call("PUSH", "n" * 65, "x"), "queue name must be")
+            self.assertError(c.call("PUSH", "q-err"), "wrong number of arguments for 'push'")
+            self.assertError(c.call("STATS"), "wrong number of arguments for 'stats'")
+            self.assertEqual(c.call("PING"), "PONG")                 # still connected
 
 
 if __name__ == "__main__":
