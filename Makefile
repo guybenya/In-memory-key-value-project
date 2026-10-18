@@ -83,9 +83,15 @@ mutation: tests/test_database.c src/database.c | $(BUILD)
 integration: $(BUILD)/server
 	python3 tests/integration_test.py ./$(BUILD)/server
 
+# Same integration test, against a server built with AddressSanitizer + UBSan. Catches memory errors in the
+# event loop and the command code: on the first error the server aborts, and the remaining tests fail.
+integration-asan: src/*.c src/*.h | $(BUILD)
+	$(CC) $(CFLAGS) $(SAN_FLAGS) src/main.c src/server.c src/database.c src/resp.c -o $(BUILD)/server_asan
+	python3 tests/integration_test.py ./$(BUILD)/server_asan
+
 clean:
 	rm -rf $(BUILD)
 
 -include $(wildcard $(BUILD)/*.d)
 
-.PHONY: all test asan leaks check mutation integration clean
+.PHONY: all test asan leaks check mutation integration integration-asan clean

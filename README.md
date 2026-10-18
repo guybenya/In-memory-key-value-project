@@ -60,6 +60,41 @@ OK
 Several commands can be sent in one write (pipelining). They are executed in order and all replies are
 sent back together.
 
+## How it works
+
+The server serves many clients at once with a single thread and a `poll()` event loop:
+
+1. `poll()` sleeps until at least one socket is ready: a new connection is waiting, a client sent data,
+   or a client that had replies waiting can receive more.
+2. For each ready client, the server reads one chunk into that client's **input buffer**, executes every
+   complete command in it, and appends the replies to the client's **output buffer**. A partial command
+   stays in the input buffer until the rest arrives.
+3. Replies are sent right away. If the client's socket is full, the rest stays in the output buffer and is
+   sent when `poll()` reports the socket writable again.
+
+All sockets are non-blocking, so a slow or stuck client never holds up the others. A client that sends
+commands without reading the replies stops being read until it catches up (backpressure), so it cannot make
+the server pile up replies in memory.
+
+To watch this happen, start the server in trace mode. Every event is printed to stderr:
+
+```sh
+KV_TRACE=1 ./build/server
+```
+
+Output for `redis-cli -p 8080 SET name guy`:
+
+```
+[trace] poll: 1 socket(s) ready
+[trace] fd 4: client connected (1 clients)
+[trace] poll: 1 socket(s) ready
+[trace] fd 4: read 32 bytes
+[trace]     execute SET (3 args)
+[trace] fd 4: sent 5 bytes
+[trace] poll: 1 socket(s) ready
+[trace] fd 4: closed (client disconnected)
+```
+
 ## Tests
 
 | Target          | What it does                                                                                  |
@@ -70,19 +105,24 @@ sent back together.
 | `make check`    | Runs `test` and `asan`, plus `leaks` on macOS. On Linux, `asan` already detects leaks.        |
 | `make mutation` | Builds a deliberately broken copy of `database.c` and checks that the tests catch the bug.    |
 | `make integration` | Starts the real server on a free port and tests it over TCP, like a real client (Python 3, standard library only). |
+| `make integration-asan` | The same integration test against a server built with AddressSanitizer and UBSan.      |
 
 A single test can be run by name, for example `./build/test_database deep_copy`.
 
 The integration test (`tests/integration_test.py`) covers what unit tests cannot see: a command that
 arrives one byte at a time, several commands in one write, a value large enough to need many reads, and
-the error paths. CI runs all of the above on every pull request.
+the error paths, and many clients at once: 50 clients connected together, a client stuck in the middle of a
+command, and a client that does not read its replies, while the others must still be served. CI runs all of
+the above on every pull request.
 
 ## Current limitations and known bugs
 
 This section is kept honest and up to date. Everything here is planned to be fixed in a later stage.
 
-- **One client at a time.** The server handles a client until it disconnects. A second client waits
-  without any reply until then. *(Fix: event loop with `poll()`, stage 2.)*
+- **At most 1024 clients at once.** Further connections are accepted and closed right away.
+- **One thread.** Commands run one after another. Every command is fast (a hash-table lookup), so this is
+  not a bottleneck today, but a slow command would delay all clients. It also means one CPU core.
+- **No idle timeout.** A client that connects and sends nothing keeps its slot until it disconnects.
 - **Size limits.** A command can have at most 16 arguments, and each argument at most 1 MB. A client that
   goes over a limit gets a protocol error and is disconnected, so it cannot make the server buffer
   unlimited memory.
@@ -96,8 +136,8 @@ This section is kept honest and up to date. Everything here is planned to be fix
 
 1. **Continuous integration** *(done)*: GitHub Actions runs the build and all checks on Linux and
    macOS for every push and pull request.
-2. **Protocol and concurrency** *(in progress)*: RESP, the Redis wire protocol *(done)*, and a `poll()`
-   event loop that serves many clients at once.
+2. **Protocol and concurrency** *(done)*: RESP, the Redis wire protocol, and a `poll()` event loop that
+   serves many clients at once.
 3. **Queue core:** commands to push, reserve and acknowledge jobs, with a visibility timeout that returns
    jobs of crashed workers to the queue.
 4. **Python client and worker framework**, plus an example app: batch analysis of protein sequences.

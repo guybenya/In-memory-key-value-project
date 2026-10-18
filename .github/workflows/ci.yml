@@ -39,6 +39,10 @@ jobs:
       - name: Run integration test
         run: make integration EXTRA_CFLAGS=-Werror
 
+      # The same test against a server built with AddressSanitizer + UBSan.
+      - name: Run integration test with sanitizers
+        run: make integration-asan EXTRA_CFLAGS=-Werror
+
       # Confirms the tests still catch a deliberately planted bug.
       - name: Run mutation test
         run: make mutation

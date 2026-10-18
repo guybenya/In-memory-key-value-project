@@ -9,6 +9,8 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <errno.h>
+#include <poll.h>
+#include <fcntl.h>
 
 
 
@@ -61,8 +63,10 @@ int start_server(int port) {
     }
 
     // System call that transitions the socket from an active state to a passive listening state.
-    // The number 3 defines the backlog queue length: the maximum number of pending connections the OS will queue before rejecting new ones.
-    if (listen(server_fd, 3) < 0) {
+    // The second argument is the backlog: how many new connections the OS queues until we accept() them.
+    // SOMAXCONN = the biggest value the OS allows. A small backlog (it used to be 3) makes the OS refuse
+    // connections when many workers connect at the same moment.
+    if (listen(server_fd, SOMAXCONN) < 0) {
         perror("Listen failed");
         exit(EXIT_FAILURE);
     }
@@ -73,23 +77,24 @@ int start_server(int port) {
     return server_fd;
 }
 
-// Sends exactly 'len' bytes from 'buf'. Returns 0 on success, -1 on failure.
-static int send_all(int fd, const char *buf, size_t len) {
-    size_t sent = 0;
-    while (sent < len) {
-        ssize_t n = write(fd, buf + sent, len - sent);
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return -1;  
-        }
-        else {
-            sent = sent + n;
-        }
-    }
-    return 0;
-}
+// ---------------------------------------------------------------------------------------------
+// TRACE MODE
+// ---------------------------------------------------------------------------------------------
+
+// AUTHOR: Claude (trace_on, TRACE)
+// Run with  KV_TRACE=1 ./build/server  to print every event (connect, read, execute, send, close)
+// to stderr - a way to watch the event loop work step by step. Off by default.
+static int trace_on = 0;
+
+// MACRO with a variable number of arguments: __VA_ARGS__ = "everything passed to TRACE",
+// handed to fprintf like printf's "...". "[trace] " "fmt" are two string literals - C glues them into one.
+// do { ... } while (0) makes the macro act like ONE statement, so it is safe inside an if without braces.
+#define TRACE(...) do {                               \
+        if (trace_on) {                               \
+            fprintf(stderr, "[trace] " __VA_ARGS__);  \
+            fputc('\n', stderr);                      \
+        }                                             \
+    } while (0)
 
 
 // ---------------------------------------------------------------------------------------------
@@ -136,6 +141,8 @@ static int execute_command(HashTable *db, const RespCommand *cmd, RespBuf *out) 
             return resp_write_error(out, "null bytes in arguments are not supported");
         }
     }
+
+    TRACE("    execute %.*s (%d args)", cmd->argv_len[0] > 32 ? 32 : (int)cmd->argv_len[0], cmd->argv[0], cmd->argc);
 
     // PING -> +PONG. Clients use it to check that the server is alive.
     if (arg_is(cmd, 0, "PING")) {
@@ -257,8 +264,18 @@ static int process_input(HashTable *db, RespBuf *in, RespBuf *out) {
     return 0;
 }
 
-// AUTHOR: Claude (READ_CHUNK, MAX_INPUT_BUFFER, handle_client)
-// Bytes read from the socket per read() call.
+// ---------------------------------------------------------------------------------------------
+// EVENT LOOP
+// ---------------------------------------------------------------------------------------------
+//
+// ONE thread serves ALL clients. Instead of waiting on one client (the old blocking read()),
+// the server asks the OS with poll(): "wake me up when ANY of these sockets is ready", then handles
+// only the sockets that are ready, and goes back to sleep. Every socket is NON-BLOCKING, so no single
+// call can freeze the server - a slow or stuck client only affects itself.
+
+// AUTHOR: Claude (everything from here to the end of the file)
+
+// Bytes read from a socket per read() call.
 #define READ_CHUNK 4096
 
 // LIMIT: the biggest legal command is RESP_MAX_ARGS arguments of RESP_MAX_BULK_LEN bytes each, plus headers.
@@ -266,46 +283,238 @@ static int process_input(HashTable *db, RespBuf *in, RespBuf *out) {
 // otherwise it could make the server buffer memory forever.
 #define MAX_INPUT_BUFFER (RESP_MAX_ARGS * (RESP_MAX_BULK_LEN + 32) + 32)
 
-void handle_client(int client_fd, HashTable *db) {
-    // BUFFERS: 'in' collects bytes until they form complete commands, 'out' collects replies.
-    // Both start empty and grow as needed. OWNER: handle_client - freed at the end.
-    RespBuf in = {0};
-    RespBuf out = {0};
+// Maximum number of clients connected at the same time.
+#define MAX_CLIENTS 1024
 
-    // STACK ALLOCATION: temporary landing area for each read().
+// Everything the server remembers about one client BETWEEN poll() calls.
+// The old handle_client kept this in local variables while it waited for its one client.
+// A single thread serving many clients can't wait inside a function per client, so each client's
+// state lives here instead, and the loop picks it up again when that client's socket is ready.
+typedef struct {
+    RespBuf in;        // bytes received but not handled yet - a partial command waits here
+    RespBuf out;       // replies that were not sent yet
+    size_t out_sent;   // how many bytes at the front of 'out' were already sent
+    int closing;       // 1 = protocol error: send what's left in 'out', then close
+} Client;
+
+// Two arrays kept in sync: fds[i] is what poll() watches, clients[i] is the state behind it.
+// Slot 0 is the listening socket (clients[0] is unused). Slots 1 .. nfds-1 are clients.
+// 'static' at file level = private to this file (like a private static field in Java).
+static struct pollfd fds[MAX_CLIENTS + 1];
+static Client clients[MAX_CLIENTS + 1];
+static int nfds = 0;
+
+// Switches a socket to NON-BLOCKING mode: read(), write() and accept() return -1 with errno EAGAIN
+// instead of waiting when there is nothing to do right now.
+// fcntl = "file control": F_GETFL reads the socket's flags, F_SETFL writes them back with O_NONBLOCK added.
+static int set_nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) {
+        return -1;
+    }
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+// "Nothing to do right now" on a non-blocking socket. Some systems use EWOULDBLOCK, some EAGAIN.
+static int would_block(void) {
+    return errno == EAGAIN || errno == EWOULDBLOCK;
+}
+
+// Closes client i and frees its buffers. To keep the arrays without holes, the LAST client is moved
+// into slot i (O(1), and the order of clients doesn't matter).
+// OWNERSHIP: the struct copy moves the last client's buffer pointers into slot i - nothing is freed twice,
+// because slot nfds is no longer in use after the move.
+static void close_client(int i, const char *reason) {
+    TRACE("fd %d: closed (%s)", fds[i].fd, reason);
+    close(fds[i].fd);
+    resp_buf_free(&clients[i].in);
+    resp_buf_free(&clients[i].out);
+    nfds--;
+    if (i != nfds) {
+        fds[i] = fds[nfds];
+        clients[i] = clients[nfds];
+    }
+}
+
+// Accepts ALL connections that are waiting (there can be several per wake-up).
+static void accept_clients(int listen_fd) {
+    while (1) {
+        // NULL, NULL = we don't need the client's address.
+        int fd = accept(listen_fd, NULL, NULL);
+        if (fd < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (!would_block()) {
+                perror("accept failed");
+            }
+            return;     // EAGAIN = no more waiting connections
+        }
+        // Full: accept and close right away. Leaving it un-accepted would make poll() wake us up forever.
+        if (nfds == MAX_CLIENTS + 1) {
+            TRACE("fd %d: rejected (too many clients)", fd);
+            close(fd);
+            continue;
+        }
+        // Set explicitly: on Linux an accepted socket does NOT inherit O_NONBLOCK from the listening socket.
+        if (set_nonblocking(fd) < 0) {
+            perror("fcntl failed");
+            close(fd);
+            continue;
+        }
+        fds[nfds].fd = fd;
+        fds[nfds].events = POLLIN;
+        fds[nfds].revents = 0;              // not ready in this round - it hasn't been polled yet
+        clients[nfds] = (Client){0};        // empty buffers, nothing sent, not closing
+        nfds++;
+        TRACE("fd %d: client connected (%d clients)", fd, nfds - 1);
+    }
+}
+
+// Sends as much of client i's pending replies as the OS accepts right now.
+// Returns 0 if the client is still open, -1 if it was closed.
+static int flush_output(int i) {
+    Client *c = &clients[i];
+    while (c->out_sent < c->out.len) {
+        ssize_t n = write(fds[i].fd, c->out.data + c->out_sent, c->out.len - c->out_sent);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (would_block()) {
+                // The OS buffer for this socket is full: the client isn't reading as fast as we write.
+                // Keep the rest - poll() reports POLLOUT when there is room again.
+                TRACE("fd %d: socket full, %zu bytes wait for POLLOUT", fds[i].fd, c->out.len - c->out_sent);
+                return 0;
+            }
+            close_client(i, "write failed");
+            return -1;
+        }
+        c->out_sent += (size_t)n;
+        TRACE("fd %d: sent %zd bytes", fds[i].fd, n);
+    }
+    // Everything was sent - reuse the buffer from the start.
+    c->out.len = 0;
+    c->out_sent = 0;
+    if (c->closing) {
+        close_client(i, "protocol error");
+        return -1;
+    }
+    return 0;
+}
+
+// Client i's socket has data: read ONE chunk, run every complete command, and try to send the replies.
+// One read per wake-up keeps it fair - a client sending a lot can't starve the others.
+// Returns 0 if the client is still open, -1 if it was closed.
+static int handle_readable(int i, HashTable *db) {
+    Client *c = &clients[i];
+    // STACK ALLOCATION: temporary landing area for this read().
     char chunk[READ_CHUNK];
 
-    while (1) {
-        // SYSTEM CALL: read() - blocks until the client sends something.
-        ssize_t n = read(client_fd, chunk, sizeof(chunk));
-        if (n < 0 && errno == EINTR) {
-            continue;   // interrupted by a signal before any data arrived - just try again
+    ssize_t n = read(fds[i].fd, chunk, sizeof(chunk));
+    if (n < 0) {
+        if (errno == EINTR || would_block()) {
+            return 0;   // nothing to read after all - try again next round
         }
-        if (n <= 0) {
-            break;      // 0 = the client closed the connection, < 0 = error
-        }
+        close_client(i, "read failed");
+        return -1;
+    }
+    if (n == 0) {
+        close_client(i, "client disconnected");
+        return -1;
+    }
+    TRACE("fd %d: read %zd bytes", fds[i].fd, n);
 
-        if (resp_buf_append(&in, chunk, (size_t)n) < 0) {
-            break;      // out of memory
-        }
-
-        // Run all complete commands. Replies pile up in 'out' - one per command, in order.
-        int rc = process_input(db, &in, &out);
-
-        // SEND: all replies at once - one send for many pipelined commands.
-        // Sent even when rc == -1, so the client gets the "Protocol error" reply before we hang up.
-        if (out.len > 0) {
-            if (send_all(client_fd, out.data, out.len) < 0) {
-                break;  // the client is gone
-            }
-            out.len = 0;    // keep the memory, reuse it for the next replies
-        }
-
-        if (rc < 0 || in.len > MAX_INPUT_BUFFER) {
-            break;
-        }
+    if (resp_buf_append(&c->in, chunk, (size_t)n) < 0) {
+        close_client(i, "out of memory");
+        return -1;
     }
 
-    resp_buf_free(&in);
-    resp_buf_free(&out);
+    // Guy's process_input - unchanged from the one-client version. It never touches the socket, only buffers,
+    // which is exactly why it works as-is inside an event loop.
+    if (process_input(db, &c->in, &c->out) < 0) {
+        c->closing = 1;     // stop reading; flush_output closes the connection after the error reply is out
+    } else if (c->in.len > MAX_INPUT_BUFFER) {
+        close_client(i, "input too large");
+        return -1;
+    }
+    if (c->in.len > 0) {
+        TRACE("fd %d: %zu bytes wait for the rest of a command", fds[i].fd, c->in.len);
+    }
+
+    // Try to send the replies right away. Usually the socket has room, which saves a whole poll() round.
+    return flush_output(i);
+}
+
+void run_event_loop(int listen_fd, HashTable *db) {
+    trace_on = getenv("KV_TRACE") != NULL;
+
+    if (set_nonblocking(listen_fd) < 0) {
+        perror("fcntl failed");
+        exit(EXIT_FAILURE);
+    }
+    fds[0].fd = listen_fd;
+    fds[0].events = POLLIN;     // on a listening socket, "readable" = a new connection is waiting
+    nfds = 1;
+
+    printf("Waiting for connections... \n");
+
+    while (1) {
+        // STEP 1: Tell poll() what to wait for, per client.
+        // BACKPRESSURE: a client with unsent replies is not reading them, so we stop reading ITS commands
+        // until it catches up (POLLOUT only). Otherwise a client that pipelines without reading would make
+        // the server pile up replies in memory forever. Its unread commands wait in the OS buffer instead.
+        for (int i = 1; i < nfds; i++) {
+            if (clients[i].out_sent < clients[i].out.len) {
+                fds[i].events = POLLOUT;
+            } else {
+                fds[i].events = POLLIN;
+            }
+        }
+
+        // STEP 2: SYSTEM CALL poll() - sleep until at least one socket is ready. -1 = no timeout.
+        // The OS fills fds[i].revents with what happened to each socket.
+        int ready = poll(fds, (nfds_t)nfds, -1);
+        if (ready < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("poll failed");
+            exit(EXIT_FAILURE);
+        }
+        TRACE("poll: %d socket(s) ready", ready);
+
+        // STEP 3: New connections.
+        if (fds[0].revents & POLLIN) {
+            accept_clients(listen_fd);
+        }
+
+        // STEP 4: Clients. When client i is closed, the last client moves into slot i, so we look at
+        // slot i again instead of moving on - the moved client hasn't been handled in this round yet.
+        int i = 1;
+        while (i < nfds) {
+            short ev = fds[i].revents;
+            // POLLERR = socket error, POLLNVAL = not an open socket.
+            if (ev & (POLLERR | POLLNVAL)) {
+                close_client(i, "socket error");
+                continue;
+            }
+            // POLLHUP = the client hung up. read() then returns 0 (or the last bytes it sent), so read handles it.
+            if ((ev & (POLLIN | POLLHUP)) && !clients[i].closing) {
+                if (handle_readable(i, db) < 0) {
+                    continue;
+                }
+            }
+            if (ev & POLLOUT) {
+                if (flush_output(i) < 0) {
+                    continue;
+                }
+            }
+            if ((ev & POLLHUP) && clients[i].closing) {
+                close_client(i, "client disconnected");
+                continue;
+            }
+            i++;
+        }
+    }
 }
