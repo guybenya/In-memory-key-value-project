@@ -79,9 +79,13 @@ mutation: tests/test_database.c src/database.c | $(BUILD)
 		echo "MUTANT KILLED - the test caught the bug, as expected."; \
 	fi
 
+# INTEGRATION TEST: starts the real server on a free port and talks RESP to it over TCP (Python standard library only).
+integration: $(BUILD)/server
+	python3 tests/integration_test.py ./$(BUILD)/server
+
 clean:
 	rm -rf $(BUILD)
 
 -include $(wildcard $(BUILD)/*.d)
 
-.PHONY: all test asan leaks check mutation clean
+.PHONY: all test asan leaks check mutation integration clean

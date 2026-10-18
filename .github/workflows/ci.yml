@@ -35,6 +35,10 @@ jobs:
       - name: Run tests and sanitizers
         run: make check EXTRA_CFLAGS=-Werror
 
+      # Starts the real server and talks to it over TCP (Python is preinstalled on both runners).
+      - name: Run integration test
+        run: make integration EXTRA_CFLAGS=-Werror
+
       # Confirms the tests still catch a deliberately planted bug.
       - name: Run mutation test
         run: make mutation
