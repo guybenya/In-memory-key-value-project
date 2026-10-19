@@ -97,9 +97,21 @@ integration-asan: src/*.c src/*.h | $(BUILD)
 	$(CC) $(CFLAGS) $(SAN_FLAGS) src/main.c src/server.c src/database.c src/resp.c src/queue.c -o $(BUILD)/server_asan
 	python3 tests/integration_test.py ./$(BUILD)/server_asan
 
+# PYTHON: the project's virtualenv if it exists (it has Biopython for the demo), else the system python3.
+# Override with: make python-test PYTHON=/path/to/python
+PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
+
+# PYTHON TESTS: the client library and the worker framework, against the real server (see tests/test_*.py).
+python-test: $(BUILD)/server
+	$(PYTHON) -m unittest discover -s tests -p 'test_*.py' -v
+
+# Same Python tests against the AddressSanitizer + UBSan server build (made by integration-asan).
+python-test-asan: integration-asan
+	JOBQUEUE_SERVER=./$(BUILD)/server_asan $(PYTHON) -m unittest discover -s tests -p 'test_*.py'
+
 clean:
 	rm -rf $(BUILD)
 
 -include $(wildcard $(BUILD)/*.d)
 
-.PHONY: all test asan leaks check mutation integration integration-asan clean
+.PHONY: all test asan leaks check mutation integration integration-asan python-test python-test-asan clean
