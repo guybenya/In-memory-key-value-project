@@ -46,3 +46,27 @@ jobs:
       # Confirms the tests still catch a deliberately planted bug.
       - name: Run mutation test
         run: make mutation
+
+      # A fixed Python version, so the Biopython wheel is the same on both runners.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # A virtualenv (Ubuntu forbids pip installs into the system Python); the Makefile uses .venv automatically.
+      - name: Install demo dependencies
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -r demo/requirements.txt
+
+      # Client library, worker framework and protein demo (incl. a small end-to-end run with a killed worker).
+      - name: Run Python tests
+        run: make python-test EXTRA_CFLAGS=-Werror
+
+      # The same Python tests against the AddressSanitizer + UBSan server.
+      - name: Run Python tests with sanitizers
+        run: make python-test-asan EXTRA_CFLAGS=-Werror
+
+      # The crash demo on a small data set: kill -9 one worker mid-job; fails if any job or result row is lost.
+      - name: Run crash demo
+        run: make demo-ci EXTRA_CFLAGS=-Werror

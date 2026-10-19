@@ -93,9 +93,12 @@ integration: $(BUILD)/server
 
 # Same integration test, against a server built with AddressSanitizer + UBSan. Catches memory errors in the
 # event loop and the command code: on the first error the server aborts, and the remaining tests fail.
-integration-asan: src/*.c src/*.h | $(BUILD)
-	$(CC) $(CFLAGS) $(SAN_FLAGS) src/main.c src/server.c src/database.c src/resp.c src/queue.c -o $(BUILD)/server_asan
+integration-asan: $(BUILD)/server_asan
 	python3 tests/integration_test.py ./$(BUILD)/server_asan
+
+# The server built with AddressSanitizer + UBSan, used by integration-asan and python-test-asan.
+$(BUILD)/server_asan: src/*.c src/*.h | $(BUILD)
+	$(CC) $(CFLAGS) $(SAN_FLAGS) src/main.c src/server.c src/database.c src/resp.c src/queue.c -o $@
 
 # PYTHON: the project's virtualenv if it exists (it has Biopython for the demo), else the system python3.
 # Override with: make python-test PYTHON=/path/to/python
@@ -105,8 +108,8 @@ PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
 python-test: $(BUILD)/server
 	$(PYTHON) -m unittest discover -s tests -p 'test_*.py' -v
 
-# Same Python tests against the AddressSanitizer + UBSan server build (made by integration-asan).
-python-test-asan: integration-asan
+# Same Python tests against the AddressSanitizer + UBSan server build.
+python-test-asan: $(BUILD)/server_asan
 	JOBQUEUE_SERVER=./$(BUILD)/server_asan $(PYTHON) -m unittest discover -s tests -p 'test_*.py'
 
 # DEMO: the protein batch-analysis pipeline end to end (server, producer, 4 workers, SQLite, anomaly report).

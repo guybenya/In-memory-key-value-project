@@ -7,12 +7,23 @@ reserve and acknowledge them, and a job whose worker crashes goes back to the qu
 also has a small key-value store (`SET` / `GET` / `DEL`), where the project started.
 
 It speaks the Redis protocol, serves many clients at once from a single-threaded `poll()` event loop, and is
-tested in CI on Linux and macOS. A Python client library, a worker framework and an example app (batch
-analysis of protein sequences) are next. See the [Roadmap](#roadmap).
+tested in CI on Linux and macOS. On top of it there is a [Python client library and worker
+framework](#python-client-and-workers), and an [example app](#example-app-batch-analysis-of-protein-sequences)
+that analyzes thousands of protein sequences with several workers, survives a worker killed with `kill -9`
+in the middle of a job, and stores its results in SQLite.
+
+```
+                 PUSH (1 job = 1 batch)        RESERVE / ACK
+  producer.py  ------------------------>  server  <------------>  worker.py  x N processes
+       |                                 (C, queue)                    |
+       +---- manifest ----> SQLite results.db <---- results (1 transaction per batch, then ACK)
+                                  |
+                           anomalies.sql (data-quality report)
+```
 
 ## Build and run
 
-Requirements: `clang` and `make` (macOS or Linux).
+Requirements: `clang` and `make` (macOS or Linux). The tests and the Python library also need Python 3.9 or newer.
 
 ```sh
 make all              # builds build/server
@@ -54,7 +65,7 @@ A queue is created by its first `PUSH`. Queue names are 1 to 64 bytes, and paylo
 **Delivery guarantee: at least once.** No job is lost when a worker crashes, but a job can be processed
 twice: a worker that is slower than its timeout loses the job to another worker, and both finish it.
 Workers should therefore write their results so that writing the same result twice does no harm (for
-example, insert-or-replace by job id). A late `ACK` is still accepted and deletes the job, wherever it is.
+example, insert-or-replace keyed by a stable id, as the [example app](#example-app-batch-analysis-of-protein-sequences) does). A late `ACK` is still accepted and deletes the job, wherever it is.
 
 Example session with a producer and a worker:
 
@@ -70,6 +81,97 @@ Example session with a producer and a worker:
 127.0.0.1:8080> RESERVE proteins 30
 (nil)
 ```
+
+## Python client and workers
+
+`client/jobqueue/` is a small Python library (standard library only, Python 3.9+). It is generic: the
+payload is just bytes, and nothing in it knows about proteins.
+
+```python
+from jobqueue import Client, Worker
+
+with Client(port=8080) as c:
+    job_id = c.push("emails", b"hello")     # -> new job id
+    c.stats("emails")                       # -> {"ready": 1, "reserved": 0, "acked": 0, "dead": 0}
+
+def handle(job):                            # job.id, job.payload (bytes), job.attempts
+    send_email(job.payload)                 # raise an exception to mark the job as failed
+
+Worker("emails", handle, port=8080, visibility_timeout=60).run()   # Ctrl+C to stop
+```
+
+The `Worker` loop is `RESERVE` -> `handle(job)` -> `ACK`:
+
+- **Empty queue:** `RESERVE` does not wait, so the worker sleeps before asking again, starting at 0.1 s
+  and doubling up to 2 s while the queue stays empty.
+- **Handler raises:** the job is not acked. The server gives it to a worker again when its visibility
+  timeout ends, and after 5 attempts it becomes *dead*.
+- **Retries:** a job with `attempts > 1` is logged as a retry. An `ACK` that returns `0` is logged as a
+  *late ACK*: the job's timeout ran out, and another worker already handled it.
+- **Stopping:** the first Ctrl+C (or `SIGTERM`) lets the current job finish and be acked, then the worker
+  exits. A second Ctrl+C stops at once, and the unfinished job comes back after its timeout, as after a crash.
+- **Lost connection:** the worker reconnects, waiting a little longer after each failed try, and gives up
+  after 5 tries.
+
+Because delivery is at least once, a handler must be **idempotent**: running it twice on the same job must
+give the same result as running it once.
+
+## Example app: batch analysis of protein sequences
+
+`demo/protein/` uses the library to analyze 3,000 human proteins from
+[UniProt Swiss-Prot](https://www.uniprot.org/), plus 10 deliberately bad records (`data/bad_examples.fasta`).
+
+- **Producer** (`producer.py`): reads the FASTA files, writes a *manifest* (every sequence it sends) to
+  SQLite, and pushes one job per batch of 200 sequences. A job per sequence would spend most of its time
+  on network round trips, because one sequence is only about 10 ms of work.
+- **Worker** (`worker.py`, run as several processes): for every sequence in the batch it runs:
+  1. **QC** (`qc.py`): flags empty sequences, invalid characters (digits, `*`, `-`), non-standard residues
+     (`X`, `B`, `U`, ...), DNA put in the protein file by mistake, very short and lowercase sequences.
+     Bad records are **flagged, never dropped**: every input sequence gets a result row.
+  2. **Properties** with Biopython: length, molecular weight, isoelectric point, GRAVY and composition.
+  3. **Closest reference**: local alignment (BLOSUM62) against 20 well-known proteins, with identity and
+     coverage. This is the heavy step, about 2 s of CPU per batch.
+
+  The whole batch is written in **one transaction, before the `ACK`**. If the worker dies between the
+  two, the batch is simply written again.
+- **Results** (`results_db.py`): tables `manifest`, `results` and `qc_flags`. Writes are idempotent:
+  `INSERT OR REPLACE` keyed by the sequence's position in the input, so a batch processed twice leaves
+  exactly the same rows. Several worker processes share the file in SQLite's WAL mode.
+- **Anomaly queries** (`anomalies.sql`, printed by `report.py`): completeness (sent vs. stored), QC flag
+  counts, duplicate sequences and duplicate ids (found in SQL because copies can sit in different batches),
+  weight-per-residue and pI outliers, identity and coverage of the closest matches, and batches that were
+  written by a retry.
+
+Run it (Biopython is needed only for the demo):
+
+```sh
+python3 -m venv .venv && .venv/bin/pip install -r demo/requirements.txt
+make demo          # server + producer + 4 workers + checks + report
+make crash-demo    # the same, but one worker is killed with kill -9 in the middle of a job
+```
+
+`run_demo.py` starts its own server on a free port, waits for the queue to drain, and fails unless every
+job is acked, no job is dead, and every sequence in the manifest has a result row. Output of
+`make crash-demo` (shortened):
+
+```
+pushed 3010 sequences in 16 jobs (batch size 200) to queue 'proteins'
+  0.2s   ready  12   reserved  4   acked   0   dead 0
+  0.2s   >>> kill -9 worker 1 (pid 4770) while it holds a job <<<
+  ...
+  8.7s   ready   0   reserved  3   acked  13   dead 0
+ 10.2s   ready   1   reserved  2   acked  13   dead 0     <- the killed worker's job is back after its 10 s timeout
+ 12.2s   ready   0   reserved  0   acked  16   dead 0
+
+Checks:
+  [OK] all 16 jobs acked
+  [OK] no dead jobs
+  [OK] result rows (3010) == input sequences (3010)
+  [OK] no sequence missing from the results
+  [OK] the killed worker's batch was redone by another worker (1 retried)
+```
+
+With 4 workers on a 10-core laptop the full run takes about 8.5 s (about 350 sequences per second).
 
 ## Key-value commands
 
@@ -152,18 +254,26 @@ Output for `redis-cli -p 8080 SET name guy`:
 | `make mutation` | Builds a deliberately broken copy of `database.c` and checks that the tests catch the bug.    |
 | `make integration` | Starts the real server on a free port and tests it over TCP, like a real client (Python 3, standard library only). |
 | `make integration-asan` | The same integration test against a server built with AddressSanitizer and UBSan.      |
+| `make python-test` | Python tests: client library, worker framework and protein demo, against the real server.  |
+| `make python-test-asan` | The same Python tests against the AddressSanitizer + UBSan server.                     |
+| `make demo-ci`  | A small crash demo (110 sequences, 2 workers, one killed); fails if anything is lost.         |
 
 A single test can be run by name, for example `./build/test_database deep_copy`.
 
 The integration test (`tests/integration_test.py`) covers what unit tests cannot see: a command that
 arrives one byte at a time, several commands in one write, a value large enough to need many reads, and
 the error paths, and many clients at once: 50 clients connected together, a client stuck in the middle of a
-command, and a client that does not read its replies, while the others must still be served. CI runs all of
-the above on every pull request.
+command, and a client that does not read its replies, while the others must still be served.
+
+The Python tests (`tests/test_client.py`, `test_worker.py`, `test_demo.py`) include a worker killed with
+`SIGKILL` while it holds a job (the job comes back as attempt 2 and is finished by another worker), a clean
+stop on `SIGINT`, a job that always fails ending up *dead*, a batch written twice leaving the same rows,
+and a failed batch writing nothing. Tests that need Biopython are skipped without it. CI runs all of the
+above on every pull request.
 
 ## Current limitations and known bugs
 
-This section is kept honest and up to date. Everything here is planned to be fixed in a later stage.
+This section is kept honest and up to date. Most of it is planned to be fixed in a later stage.
 
 - **At most 1024 clients at once.** Further connections are accepted and closed right away.
 - **One thread.** Commands run one after another. Every command is fast (a hash-table lookup), so this is
@@ -186,6 +296,21 @@ This section is kept honest and up to date. Everything here is planned to be fix
   get a protocol error. Use `redis-cli` or any Redis client library.
 - **No persistence.** All data is lost when the server stops. *(Fix: append-only file, stage 5.)*
 
+Python library and demo:
+
+- **The worker waits for the server.** If the server is down, a worker retries 5 times, waiting longer each
+  time, and then exits with an error. Something outside it (a process supervisor) has to restart it.
+- **One connection per `Client`, not thread-safe.** Use one `Client` per thread or process. The demo runs
+  its workers as separate processes, which also lets them use several CPU cores.
+- **Not packaged.** The library is imported from `client/` by a path, not installed with `pip`.
+- **The visibility timeout must be longer than the slowest job**, or a slow job is handed out twice. The
+  work is not lost, but it is done twice (the result is the same, thanks to idempotent writes). There is
+  no way yet for a worker to extend its timeout while it works.
+- **SQLite allows one writer at a time.** Workers wait for each other's commit (one short transaction per
+  batch). That is fine for a handful of workers; many more would need a database server.
+- **The demo's science is simple.** 20 reference proteins instead of a real database search, fixed QC
+  rules, and duplicates are reported, not resolved.
+
 ## Roadmap
 
 1. **Continuous integration** *(done)*: GitHub Actions runs the build and all checks on Linux and
@@ -194,12 +319,10 @@ This section is kept honest and up to date. Everything here is planned to be fix
    serves many clients at once.
 3. **Queue core** *(done)*: commands to push, reserve and acknowledge jobs, with a visibility timeout that
    returns jobs of crashed workers to the queue, and dead jobs after repeated failures.
-4. **Python client and worker framework**, plus an example app: batch analysis of protein sequences.
-   A FASTA file is split into jobs of a few hundred sequences each. Workers validate the sequences
-   (invalid characters, empty or duplicate entries), compute their properties (length, molecular weight,
-   isoelectric point, composition, hydrophobicity), and align each one against a small set of known
-   proteins to find its closest match. Results are stored in SQLite and queried with SQL. A benchmark
-   shows how throughput changes with the number of workers and with the job size.
+4. **Python client and worker framework** *(done)*, plus an example app: batch analysis of protein
+   sequences with QC flags, Biopython properties, alignment to reference proteins, idempotent SQLite
+   results, anomaly queries, and a crash demo. *(Not done: a benchmark graph of throughput against the
+   number of workers.)*
 5. **Durability:** an append-only log and recovery from it, with a `kill -9` demo where no job is lost.
 6. **Packaging:** Docker image published automatically on every release.
 
