@@ -109,9 +109,23 @@ python-test: $(BUILD)/server
 python-test-asan: integration-asan
 	JOBQUEUE_SERVER=./$(BUILD)/server_asan $(PYTHON) -m unittest discover -s tests -p 'test_*.py'
 
+# DEMO: the protein batch-analysis pipeline end to end (server, producer, 4 workers, SQLite, anomaly report).
+# Needs Biopython: python3 -m venv .venv && .venv/bin/pip install -r demo/requirements.txt
+demo: $(BUILD)/server
+	$(PYTHON) demo/protein/run_demo.py --workers 4
+
+# CRASH DEMO: the same, but one worker is killed with SIGKILL in the middle of a job. Every job must still finish.
+crash-demo: $(BUILD)/server
+	$(PYTHON) demo/protein/run_demo.py --workers 4 --kill-one
+
+# Small crash demo for CI: 110 sequences, 2 workers, short timeout. Fails (exit 1) if anything is lost.
+demo-ci: $(BUILD)/server
+	$(PYTHON) demo/protein/run_demo.py --fasta demo/protein/data/ci_sample_100.fasta demo/protein/data/bad_examples.fasta \
+		--workers 2 --batch-size 20 --kill-one --timeout 3
+
 clean:
 	rm -rf $(BUILD)
 
 -include $(wildcard $(BUILD)/*.d)
 
-.PHONY: all test asan leaks check mutation integration integration-asan python-test python-test-asan clean
+.PHONY: all test asan leaks check mutation integration integration-asan python-test python-test-asan demo crash-demo demo-ci clean
