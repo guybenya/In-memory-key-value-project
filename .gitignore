@@ -13,3 +13,6 @@ build/
 
 # VS Code settings
 .vscode/
+# Python
+__pycache__/
+.venv/

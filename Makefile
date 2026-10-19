@@ -93,13 +93,42 @@ integration: $(BUILD)/server
 
 # Same integration test, against a server built with AddressSanitizer + UBSan. Catches memory errors in the
 # event loop and the command code: on the first error the server aborts, and the remaining tests fail.
-integration-asan: src/*.c src/*.h | $(BUILD)
-	$(CC) $(CFLAGS) $(SAN_FLAGS) src/main.c src/server.c src/database.c src/resp.c src/queue.c -o $(BUILD)/server_asan
+integration-asan: $(BUILD)/server_asan
 	python3 tests/integration_test.py ./$(BUILD)/server_asan
+
+# The server built with AddressSanitizer + UBSan, used by integration-asan and python-test-asan.
+$(BUILD)/server_asan: src/*.c src/*.h | $(BUILD)
+	$(CC) $(CFLAGS) $(SAN_FLAGS) src/main.c src/server.c src/database.c src/resp.c src/queue.c -o $@
+
+# PYTHON: the project's virtualenv if it exists (it has Biopython for the demo), else the system python3.
+# Override with: make python-test PYTHON=/path/to/python
+PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
+
+# PYTHON TESTS: the client library and the worker framework, against the real server (see tests/test_*.py).
+python-test: $(BUILD)/server
+	$(PYTHON) -m unittest discover -s tests -p 'test_*.py' -v
+
+# Same Python tests against the AddressSanitizer + UBSan server build.
+python-test-asan: $(BUILD)/server_asan
+	JOBQUEUE_SERVER=./$(BUILD)/server_asan $(PYTHON) -m unittest discover -s tests -p 'test_*.py'
+
+# DEMO: the protein batch-analysis pipeline end to end (server, producer, 4 workers, SQLite, anomaly report).
+# Needs Biopython: python3 -m venv .venv && .venv/bin/pip install -r demo/requirements.txt
+demo: $(BUILD)/server
+	$(PYTHON) demo/protein/run_demo.py --workers 4
+
+# CRASH DEMO: the same, but one worker is killed with SIGKILL in the middle of a job. Every job must still finish.
+crash-demo: $(BUILD)/server
+	$(PYTHON) demo/protein/run_demo.py --workers 4 --kill-one
+
+# Small crash demo for CI: 110 sequences, 2 workers, short timeout. Fails (exit 1) if anything is lost.
+demo-ci: $(BUILD)/server
+	$(PYTHON) demo/protein/run_demo.py --fasta demo/protein/data/ci_sample_100.fasta demo/protein/data/bad_examples.fasta \
+		--workers 2 --batch-size 20 --kill-one --timeout 3
 
 clean:
 	rm -rf $(BUILD)
 
 -include $(wildcard $(BUILD)/*.d)
 
-.PHONY: all test asan leaks check mutation integration integration-asan clean
+.PHONY: all test asan leaks check mutation integration integration-asan python-test python-test-asan demo crash-demo demo-ci clean
